@@ -1,8 +1,5 @@
 # Scheme: `exact` on `pinet` (Pi Network)
 
-> **NOTE**
-> This specification was drafted with AI assistance.
-
 ## Versions supported
 
 This scheme only supports x402 `v2`.
