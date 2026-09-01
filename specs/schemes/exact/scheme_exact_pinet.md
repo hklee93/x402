@@ -310,7 +310,7 @@ The final transaction hash differs from any hash of the client envelope because 
 
 The following record layout is RECOMMENDED; any implementation that provides the duplicate-handling and reconciliation behavior above is conforming. Store, per settlement identity: a payload hash, the exact signed final transaction XDR, the submitted transaction hash for the selected network passphrase, and the settlement state with its eventual terminal response.
 
-For payload comparison, a domain-tagged, length-delimited hash such as `SHA-256("x402/exact/pinet/v1" || 0x00 || u32be(len(txXdr)) || txXdr || u32be(len(reqJcs)) || reqJcs)` — where `txXdr` is the canonical re-encoded client transaction XDR and `reqJcs` is the [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) serialization of the authoritative requirements — makes replicas of one facilitator derive the same identity. The hash never appears on the wire, so any equivalent deterministic comparison of the same inputs is also conforming.
+For payload comparison, a domain-tagged, length-delimited hash such as `SHA-256("x402/exact/pinet/settlement-payload/v1" || 0x00 || u32be(len(txXdr)) || txXdr || u32be(len(reqJcs)) || reqJcs)` — where `txXdr` is the canonical re-encoded client transaction XDR and `reqJcs` is the [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) serialization of the authoritative requirements — makes replicas of one facilitator derive the same identity. The hash never appears on the wire, so any equivalent deterministic comparison of the same inputs is also conforming.
 
 ### 3. Submission and Reconciliation
 
