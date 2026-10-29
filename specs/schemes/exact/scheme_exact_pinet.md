@@ -10,30 +10,32 @@ This specification uses the Pi Network [CAIP-2](https://namespaces.chainagnostic
 
 | Network         | Network passphrase | Estimated ledger seconds |
 | --------------- | ------------------ | ------------------------ |
+| `pinet:mainnet` | `Pi Network`       | 5                        |
 | `pinet:testnet` | `Pi Testnet`       | 5                        |
 
-Network passphrases are case-sensitive and are part of the Soroban authorization signature domain. `pinet:mainnet` is not supported by this version of the scheme.
+Network passphrases are case-sensitive and are part of the Soroban authorization signature domain.
 
-The native Pi asset contract on `pinet:testnet` is:
+The native Pi asset contract and public RPC endpoint on each network are:
 
-```text
-CDG6ZM2SHXIHD5HZ2E62B7D76RY5DUHDNQVPSHRVDNN7W4EW47FXLEXQ
-```
+| Network         | Native Pi asset contract                                   | Public RPC endpoint              |
+| --------------- | ---------------------------------------------------------- | -------------------------------- |
+| `pinet:mainnet` | `CCSKNPG3WNQ357BVWHCZVUZLFUTYI3NEZDBPQSPBUBWX3OSELCOHZNMF` | `https://rpc.mainnet.minepi.com` |
+| `pinet:testnet` | `CDG6ZM2SHXIHD5HZ2E62B7D76RY5DUHDNQVPSHRVDNN7W4EW47FXLEXQ` | `https://rpc.testnet.minepi.com` |
 
-The contract ID is derived from the native asset and the `Pi Testnet` network passphrase. Implementations MAY use any trusted Pi Testnet RPC endpoint that reports the matching passphrase. The public endpoint is `https://rpc.testnet.minepi.com`.
+Each contract ID is derived from the native asset and that network's passphrase. Implementations MAY use any trusted RPC endpoint that reports the matching passphrase.
 
 ## Summary
 
-The x402 `exact` scheme on Pi uses [SEP-41](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md) token transfers. The client authorizes a Soroban authorization entry for one exact `transfer(from, to, amount)` invocation. The facilitator independently verifies that authorization, rebuilds the transaction with its own account as fee-paying source, simulates it, signs it, and submits it to Pi Testnet.
+The x402 `exact` scheme on Pi uses [SEP-41](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md) token transfers. The client authorizes a Soroban authorization entry for one exact `transfer(from, to, amount)` invocation. The facilitator independently verifies that authorization, rebuilds the transaction with its own account as fee-paying source, simulates it, signs it, and submits it to the selected Pi network.
 
 This version supports:
 
-- `pinet:testnet` only;
+- `pinet:mainnet` and `pinet:testnet`;
 - account (`G...`) payers and account (`G...`), muxed-account (`M...`), or contract (`C...`) recipients;
 - facilitator-sponsored fees; and
 - the native Pi asset contract as the initial accepted asset.
 
-Other allowlisted SEP-41 contracts MAY use the same mechanism after their interface, decimals, transfer behavior, and network deployment are verified. Pi Mainnet is out of scope.
+Other allowlisted SEP-41 contracts MAY use the same mechanism after their interface, decimals, transfer behavior, and network deployment are verified.
 
 ## Ledger Timeout Profile
 
@@ -43,7 +45,7 @@ Clients set the authorization expiration to:
 validUntilLedgerSeq = currentLedger + ceil(maxTimeoutSeconds / estimatedLedgerSeconds)
 ```
 
-`estimatedLedgerSeconds` is a normative per-network constant published in this specification's supported-networks table; for `pinet:testnet` it is currently 5. Implementations MUST use the published table value so that clients and facilitators compute identical expiration bounds; they MUST NOT derive a divergent value at runtime and MUST NOT accept an arbitrary caller-selected value.
+`estimatedLedgerSeconds` is a normative per-network constant published in this specification's supported-networks table. Implementations MUST use the published table value so that clients and facilitators compute identical expiration bounds; they MUST NOT derive a divergent value at runtime and MUST NOT accept an arbitrary caller-selected value.
 
 The published value is maintained by this specification's maintainers with the following procedure: sample the `ledgerCloseTime` of at least the 100 most recent consecutive ledgers via the RPC method [`getLedgers`](https://developers.stellar.org/docs/data/apis/rpc/api-reference/methods/getLedgers), compute the arithmetic mean of the successive close-time deltas, and round to the nearest positive integer second (minimum 1). The value is re-validated after every Pi protocol upgrade and whenever target ledger timing changes. Updating it is a change to the supported-networks table of this specification, not a per-implementation runtime decision.
 
@@ -58,7 +60,7 @@ sequenceDiagram
     participant C as Client
     participant R as Resource Server
     participant F as Facilitator
-    participant P as Pi Testnet
+    participant P as Pi RPC
 
     C->>R: Request protected resource
     R-->>C: 402 PaymentRequired + PaymentRequirements
@@ -276,7 +278,7 @@ After fresh settlement simulation, the facilitator MUST:
 - set the settlement fee to `simulationResourceFee + inclusionFeeBid`, where `inclusionFeeBid` is at least the current network base fee multiplied by the transaction's operation count (one in this scheme) and MAY be raised to account for surge pricing; and
 - reject the payment if any fee or resource dimension exceeds operator policy.
 
-The current Pi Testnet base fee is 100,000 stroops (0.01 Pi), one thousand times the 100-stroop default in upstream Stellar tooling; implementations MUST NOT inherit fee constants from that tooling. Facilitators SHOULD resolve the current base fee and surge indicators from the network's `fee_stats` endpoint or recent ledger headers.
+The current Pi base fee on both `pinet:mainnet` and `pinet:testnet` is 100,000 stroops (0.01 Pi), one thousand times the 100-stroop default in upstream Stellar tooling; implementations MUST NOT inherit fee constants from that tooling. Facilitators SHOULD resolve the current base fee and surge indicators from the network's `fee_stats` endpoint or recent ledger headers.
 
 Facilitators MAY expose `maxTransactionFeeStroops` as a circuit breaker. Its configured value MUST exceed the minimum `inclusionFeeBid` plus the largest permitted resource fee; a cap below that floor would reject every conforming settlement.
 
