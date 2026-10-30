@@ -26,7 +26,7 @@ Each contract ID is derived from the native asset and that network's passphrase.
 
 ## Summary
 
-The x402 `exact` scheme on Pi uses [SEP-41](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md) token transfers. The client authorizes a Soroban authorization entry for one exact `transfer(from, to, amount)` invocation. The facilitator independently verifies that authorization, rebuilds the transaction with its own account as fee-paying source, simulates it, signs it, and submits it to the selected Pi network.
+The x402 `exact` scheme on Pi uses [SEP-41](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md) token transfers. The client authorizes a Soroban authorization entry for one exact `transfer(from, to, amount)` invocation. The facilitator independently verifies that authorization, rebuilds the transaction with its own account as source, simulates it, signs it, and submits it to the selected Pi network. It submits the transaction wrapped in a fee bump from a separately configured fee-bump account (see [Transaction Fees](#transaction-fees)).
 
 This version supports:
 
@@ -220,7 +220,7 @@ Ignored — structurally required in a valid envelope, but never copied into the
 - the time bounds inside a permitted `PRECOND_TIME` precondition; and
 - client-provided Soroban transaction data (footprint and resource fees), which the facilitator replaces with fresh simulation results.
 
-This is deliberately stricter than the [`exact` on Stellar](./scheme_exact_stellar.md) scheme, which copies client ledger bounds, memo, minimum-sequence conditions, and extra signers into the rebuilt transaction. The Pi scheme rebuilds the settled transaction from verified components only.
+This is deliberately stricter than the reference TypeScript facilitator for [`exact` on Stellar](./scheme_exact_stellar.md), which copies client ledger bounds, memo, minimum-sequence conditions, and extra signers into the rebuilt transaction. The Pi scheme rebuilds the settled transaction from verified components only.
 
 For an `M...` recipient, the facilitator MUST preserve both its underlying Ed25519 account and its `u64` multiplexing identifier when constructing the `MuxedAddress` argument.
 
@@ -243,9 +243,10 @@ Contract payers are deferred deliberately. In this scheme's single top-level SEP
 
 ### 4. Facilitator and Resource Safety
 
+- Facilitator signers are the facilitator's settlement accounts and its fee-bump account.
 - The client transaction source MUST NOT be any facilitator signer.
-- The facilitator MUST NOT equal `from` or appear as an authorization signer.
-- The facilitator MUST select its settlement source and signer only from trusted local configuration.
+- `from` MUST NOT be any facilitator signer, and no facilitator signer may appear as an authorization signer.
+- The facilitator MUST select its settlement source, fee-bump account, and signers only from trusted local configuration.
 - The envelope, operation, authorization tree, footprint, resource dimensions, classic fee, resource fee, and total encoded size MUST be within configured limits before expensive RPC work is performed.
 - `payer` MUST be returned only after the payer authorization has been verified; it MUST NOT be copied from unverified input.
 
@@ -262,7 +263,7 @@ For example, with `amount` `10000000`:
 - `M...` recipient (`M...` encoding account `GDBW...HZGM` with multiplexing identifier `7`): the event's `to` topic contains the underlying account `GDBW...HZGM`, and the map-format data contains `amount: 10000000` and `to_muxed_id: 7` (`u64`).
 - `C...` recipient (`CA7Q...ESTN`): the event's `to` topic contains the contract address `CA7Q...ESTN`, and `to_muxed_id` is absent or void.
 - Apart from the single qualifying transfer, there MUST be no other transfer, mint, burn, or clawback effect on the accepted asset, and no other effect that debits the payer or credits the recipient. Unexpected invocation trees or balance changes MUST be rejected.
-- Because native Pi is both the payment asset and the network fee asset, protocol-level fee charge and fee refund events ([CAP-67](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0067.md#new-events-for-representing-fees)) are expected in transaction metadata and are not payment effects. They MUST affect only the configured facilitator signer and MUST be within the facilitator's fee cap; a fee or refund event affecting any other account MUST be rejected.
+- Because native Pi is both the payment asset and the network fee asset, protocol-level fee charge and fee refund events ([CAP-67](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0067.md#new-events-for-representing-fees)) are expected in transaction metadata and are not payment effects. They MUST affect only the transaction's fee source: for a simulated transaction, its source; for a landed transaction, the fee-bump fee source if it landed inside a fee bump, otherwise its source. A fee or refund event affecting any other account MUST be rejected. This holds even when the landed fee source is not a facilitator account, including the payer or the recipient: a fee bump's fee source must sign it, so its fee is self-authorized (see [Third-Party Fee Bumps](#third-party-fee-bumps)). The facilitator's fee cap applies to the fee bump it constructs and signs (see [Transaction Fees](#transaction-fees)), not to another party's.
 
 ## Error Reporting
 
@@ -272,15 +273,18 @@ For example, with `amount` `10000000`:
 
 The facilitator fully controls settlement fees and MUST NOT use the client's fee bid or Soroban resource data.
 
+The facilitator MUST submit each settlement wrapped in a fee bump ([CAP-15](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0015.md)) using its separately configured fee-bump account, so its settlement accounts need no balance for transaction fees. Account reserves still apply: a zero-balance settlement account requires sponsored reserves ([CAP-33](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0033.md)). This governs what the facilitator submits; a settlement that lands inside another party's fee bump is still accepted (see [Third-Party Fee Bumps](#third-party-fee-bumps)).
+
 After fresh settlement simulation, the facilitator MUST:
 
 - replace the Soroban footprint and resource fee with the simulation result;
-- set the settlement fee to `simulationResourceFee + inclusionFeeBid`, where `inclusionFeeBid` is at least the current network base fee multiplied by the transaction's operation count (one in this scheme) and MAY be raised to account for surge pricing; and
-- reject the payment if any fee or resource dimension exceeds operator policy.
+- set the inner transaction's fee to `simulationResourceFee + inclusionFeeBid`, where `inclusionFeeBid` is at least the current network base fee multiplied by the transaction's operation count (one in this scheme) and MAY be raised to account for surge pricing;
+- set the fee bump's fee to `simulationResourceFee + (operationCount + 1) × inclusionFeeBid`, because the fee bump is charged as one more operation; and
+- reject the payment if any fee or resource dimension exceeds operator policy. Fee policy, including the fee cap, applies when constructing and signing the facilitator's fee bump.
 
 The current Pi base fee on both `pinet:mainnet` and `pinet:testnet` is 100,000 stroops (0.01 Pi), one thousand times the 100-stroop default in upstream Stellar tooling; implementations MUST NOT inherit fee constants from that tooling. Facilitators SHOULD resolve the current base fee and surge indicators from the network's `fee_stats` endpoint or recent ledger headers.
 
-Facilitators MAY expose `maxTransactionFeeStroops` as a circuit breaker. Its configured value MUST exceed the minimum `inclusionFeeBid` plus the largest permitted resource fee; a cap below that floor would reject every conforming settlement.
+Facilitators MAY expose `maxTransactionFeeStroops` as a circuit breaker. The fee of each fee bump the facilitator constructs MUST NOT exceed it; a settlement that would need more is rejected. Because every settlement also pays a resource fee, a cap at or below twice the minimum `inclusionFeeBid` rejects every settlement.
 
 ## Settlement
 
@@ -288,12 +292,12 @@ Facilitators MAY expose `maxTransactionFeeStroops` as a circuit breaker. Its con
 
 The facilitator MUST repeat every verification rule. It then:
 
-1. obtains a fresh sequence number for a funded facilitator account, using per-signer serialization or another atomic sequence allocator;
+1. obtains a fresh sequence number for a facilitator settlement account, using per-signer serialization or another atomic sequence allocator;
 2. reconstructs a new transaction with that account as source and fresh facilitator-chosen time bounds: a `maxTime` no later than the earlier of `now + maxTimeoutSeconds` and the wall-clock estimate of the authorization's remaining lifetime (`(validUntilLedgerSeq - currentLedger) × estimatedLedgerSeconds` from now), and a `minTime` of zero or the current time. Client time bounds are never copied;
 3. copies only the verified `invokeHostFunction` operation and its signed authorization entry;
 4. simulates the reconstructed transaction;
 5. applies the fresh Soroban transaction data and bounded fee; and
-6. signs the final envelope with the facilitator key.
+6. signs the final envelope with that account's key, then wraps it in a fee bump signed by its fee-bump account.
 
 ### 2. Settlement Identity and Duplicate Handling
 
@@ -308,9 +312,11 @@ Duplicate handling is determined by the tuple together with the client payload (
 
 The final transaction hash differs from any hash of the client envelope because the facilitator changes the source, sequence number, fees, Soroban data, and envelope signature.
 
+The settlement's transaction hash is the hash of the transaction the facilitator signed with its settlement account: the inner transaction, never the fee bump. Anyone can rewrap the inner transaction in another fee bump, so the fee bump the facilitator submitted may never land while its inner transaction does (see [Third-Party Fee Bumps](#third-party-fee-bumps)). Pi RPC `getTransaction` finds a fee-bumped transaction by its inner hash.
+
 #### Recommended Settlement Record
 
-The following record layout is RECOMMENDED; any implementation that provides the duplicate-handling and reconciliation behavior above is conforming. Store, per settlement identity: a payload hash, the exact signed final transaction XDR, the submitted transaction hash for the selected network passphrase, and the settlement state with its eventual terminal response.
+The following record layout is RECOMMENDED; any implementation that provides the duplicate-handling and reconciliation behavior above is conforming. Store, per settlement identity: a payload hash, the exact signed fee-bump XDR submitted, the settlement's transaction hash for the selected network passphrase, and the settlement state with its eventual terminal response.
 
 For payload comparison, a domain-tagged, length-delimited hash such as `SHA-256("x402/exact/pinet/settlement-payload/v1" || 0x00 || u32be(len(txXdr)) || txXdr || u32be(len(reqJcs)) || reqJcs)` — where `txXdr` is the canonical re-encoded client transaction XDR and `reqJcs` is the [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) serialization of the authoritative requirements — makes replicas of one facilitator derive the same identity. The hash never appears on the wire, so any equivalent deterministic comparison of the same inputs is also conforming.
 
@@ -318,13 +324,13 @@ For payload comparison, a domain-tagged, length-delimited hash such as `SHA-256(
 
 The facilitator submits the exact signed XDR stored in the settlement record and polls Pi RPC by the stored transaction hash until `SUCCESS` or `FAILED`. It MUST NOT return `success: true` for RPC acceptance or `PENDING` alone.
 
-On `SUCCESS`, the facilitator MUST inspect the result and events and confirm the exact payment effect specified in the simulation rules, applying the same native fee-event allowance: [CAP-67](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0067.md#new-events-for-representing-fees) fee charge/refund events affecting only the facilitator signer are expected and are not payment effects. On `FAILED`, or if the confirmed effects do not match, it returns `invalid_transaction_state`.
+On `SUCCESS`, the facilitator MUST inspect the result and events and confirm the exact payment effect specified in the simulation rules, applying the same native fee-event allowance: [CAP-67](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0067.md#new-events-for-representing-fees) fee charge/refund events affecting only the landed transaction's fee source are expected and are not payment effects. A transaction that landed inside a different fee bump than the one submitted is the same settlement and MUST be accepted when its effects match. On `FAILED`, or if the confirmed effects do not match, it returns `invalid_transaction_state`.
 
 If the submission result is uncertain, the facilitator MUST retain the signed XDR and transaction hash, return `settlement_pending` with that hash, and reconcile by that hash. It MUST NOT rebuild the same authorization with a new sequence number or submit different XDR while the outcome is unresolved. Restarts, timeouts, duplicates, and concurrent requests MUST converge on the same journal record.
 
 ## `SettlementResponse`
 
-Successful settlement returns the confirmed transaction hash and the client address that paid the asset:
+Successful settlement returns the confirmed settlement transaction hash (the inner transaction's hash) and the client address that paid the asset:
 
 ```json
 {
@@ -360,7 +366,7 @@ An uncertain submission is non-terminal:
 }
 ```
 
-Facilitator accounts SHOULD be listed under `pinet:*` in the `/supported` response's `signers` map. Asset acceptance remains resource-server and facilitator policy.
+Facilitator signers, including the fee-bump account, SHOULD be listed under `pinet:*` in the `/supported` response's `signers` map. Asset acceptance remains resource-server and facilitator policy.
 
 ## Security Considerations
 
@@ -377,6 +383,12 @@ The payer authorizes only one SEP-41 transfer invocation, including the asset, p
 ### Facilitator Safety
 
 The facilitator never signs client-provided envelope contents directly. It copies only the verified invocation and authorization into a fresh transaction, derives resource data and fees from its own simulation, and applies size, fee, and resource caps. This prevents a client from using the facilitator as payer, signer, or unbounded fee sponsor.
+
+### Third-Party Fee Bumps
+
+Anyone who sees a signed settlement transaction before it lands, such as an RPC operator or a relaying node, can take its inner transaction, wrap it in their own fee bump, and submit it ([CAP-15](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0015.md)). The wrapper cannot change the payment: the inner transaction's operation, authorization, source, and sequence number are covered by its signature, and the wrapper must be signed by its own fee source, so it charges only that account.
+
+A facilitator therefore identifies the settlement by the inner transaction hash and accepts fee events naming whichever fee source landed. Rejecting such a settlement would report a payment that settled on-chain as failed. The payer is charged, the resource is withheld, and a retry cannot succeed because the authorization nonce is consumed. Any third party could then cause that for the cost of a fee.
 
 ### Payer Trust in Simulation
 
@@ -399,6 +411,8 @@ The token transfer and authorization-nonce consumption occur atomically in one t
 - [Pi CAIP-2 namespace](https://namespaces.chainagnostic.org/pinet/caip2)
 - [SEP-41 Soroban token interface](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md)
 - [SEP-41 token events](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0041.md#events)
+- [CAP-15 fee-bump transactions](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0015.md)
+- [CAP-33 sponsored reserves](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0033.md)
 - [CAP-67 unified asset events, including fee events](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0067.md#new-events-for-representing-fees)
 - [CAP-46-11 account authentication](https://github.com/stellar/stellar-protocol/blob/master/core/cap-0046-11.md#stellar-account-authentication)
 - [Soroban custom-account interface](https://github.com/stellar/rs-soroban-sdk/blob/main/soroban-sdk/src/auth.rs)
