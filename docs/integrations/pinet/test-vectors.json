@@ -110,7 +110,7 @@
       "category": "settlement",
       "input": {
         "idempotency_key": "intent-001",
-        "payload_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payload_digest": "synthetic-payload-A",
         "prior_state": "settled"
       },
       "expected": "return_or_reconcile_existing_outcome",
@@ -121,7 +121,7 @@
       "category": "settlement",
       "input": {
         "idempotency_key": "intent-001",
-        "payload_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "payload_digest": "synthetic-payload-B",
         "prior_state": "settled"
       },
       "expected": "reject_conflicting_reuse",
