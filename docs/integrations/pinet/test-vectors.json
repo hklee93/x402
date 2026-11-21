@@ -1,52 +1,67 @@
 {
   "profile": "pinet-pirc-x402-conformance",
-  "profile_version": "0.1.0",
+  "profile_version": "0.2.0",
   "protocol": {
     "x402_version": 2,
     "scheme": "exact",
-    "networks": ["pinet:testnet", "pinet:mainnet"]
+    "networks": [
+      "pinet:testnet",
+      "pinet:mainnet"
+    ]
   },
   "status": "scenario_catalogue_not_executed",
   "vectors": [
     {
       "id": "AMT-001",
       "category": "amount",
-      "input": { "amount": "10000000" },
+      "input": {
+        "amount": "10000000"
+      },
       "expected": "accept_if_within_verified_asset_range",
       "reason": "Canonical positive base-10 integer atomic amount."
     },
     {
       "id": "AMT-002",
       "category": "amount",
-      "input": { "amount": "0" },
+      "input": {
+        "amount": "0"
+      },
       "expected": "reject",
       "reason": "Payment amount must be positive."
     },
     {
       "id": "AMT-003",
       "category": "amount",
-      "input": { "amount": "-1" },
+      "input": {
+        "amount": "-1"
+      },
       "expected": "reject",
       "reason": "Signed amount syntax is not accepted."
     },
     {
       "id": "AMT-004",
       "category": "amount",
-      "input": { "amount": "1.25" },
+      "input": {
+        "amount": "1.25"
+      },
       "expected": "reject",
       "reason": "Decimal notation is not an atomic-unit integer."
     },
     {
       "id": "AMT-005",
       "category": "amount",
-      "input": { "amount": "1e6" },
+      "input": {
+        "amount": "1e6"
+      },
       "expected": "reject",
       "reason": "Exponent notation is not accepted."
     },
     {
       "id": "AMT-006",
       "category": "amount",
-      "input": { "amount": " 100 " },
+      "input": {
+        "amount": " 100 "
+      },
       "expected": "reject",
       "reason": "Whitespace must not be silently normalized."
     },
@@ -88,7 +103,10 @@
       "category": "transaction_structure",
       "input": {
         "operation_count": 2,
-        "operation_types": ["invokeHostFunction", "payment"]
+        "operation_types": [
+          "invokeHostFunction",
+          "payment"
+        ]
       },
       "expected": "reject",
       "reason": "Unexpected additional operation."
@@ -98,7 +116,9 @@
       "category": "transaction_structure",
       "input": {
         "operation_count": 1,
-        "operation_types": ["invokeHostFunction"],
+        "operation_types": [
+          "invokeHostFunction"
+        ],
         "function_name": "transfer",
         "argument_count": 4
       },
@@ -180,6 +200,146 @@
       },
       "expected": "reject_non_conserving_allocation",
       "reason": "Allocations exceed the distributable amount."
+    },
+    {
+      "id": "COM-001",
+      "category": "merchant_quote",
+      "input": {
+        "quote_expired": true,
+        "buyer_approved": true
+      },
+      "expected": "reject_require_new_quote",
+      "reason": "An expired quote cannot be used to create a new payment requirement."
+    },
+    {
+      "id": "COM-002",
+      "category": "merchant_quote",
+      "input": {
+        "approved_amount_atomic": "500",
+        "current_quote_amount_atomic": "550"
+      },
+      "expected": "reject_amount_mutation",
+      "reason": "A changed quote requires explicit buyer approval of a new payment amount."
+    },
+    {
+      "id": "EVT-001",
+      "category": "commerce_event",
+      "input": {
+        "event_id": "event-001",
+        "already_consumed": true
+      },
+      "expected": "idempotent_noop",
+      "reason": "Duplicate event delivery must not duplicate state transitions or fulfilment."
+    },
+    {
+      "id": "EVT-002",
+      "category": "commerce_event",
+      "input": {
+        "event_type": "PAYMENT_CONFIRMED",
+        "settlement_readback_present": false
+      },
+      "expected": "reject_or_quarantine",
+      "reason": "A commerce event cannot establish payment finality without independent settlement evidence."
+    },
+    {
+      "id": "QRN-001",
+      "category": "qr_nfc",
+      "input": {
+        "request_expired": true,
+        "nonce_reused": false
+      },
+      "expected": "reject",
+      "reason": "Expired payment handoff requests are not valid authorization requests."
+    },
+    {
+      "id": "QRN-002",
+      "category": "qr_nfc",
+      "input": {
+        "contains_private_key_material": true
+      },
+      "expected": "reject_and_raise_security_signal",
+      "reason": "QR/NFC transport must never carry wallet secrets."
+    },
+    {
+      "id": "SUB-001",
+      "category": "subscription",
+      "input": {
+        "billing_period": "2026-11",
+        "fresh_user_authorization": false
+      },
+      "expected": "do_not_submit_payment",
+      "reason": "A recurring billing agreement does not imply indefinite wallet authorization."
+    },
+    {
+      "id": "SUB-002",
+      "category": "subscription_recovery",
+      "input": {
+        "period_id": "period-001",
+        "broadcast_outcome": "unknown"
+      },
+      "expected": "reconcile_before_retry",
+      "reason": "An uncertain billing attempt must be reconciled before another attempt for the same period."
+    },
+    {
+      "id": "MET-001",
+      "category": "metrics",
+      "input": {
+        "included_event_classes": [
+          "settled",
+          "pending",
+          "self_transfer",
+          "duplicate"
+        ]
+      },
+      "expected": "exclude_ineligible_events_and_disclose",
+      "reason": "Economic metrics must exclude pending, duplicate and circular/self-transfer activity."
+    },
+    {
+      "id": "MET-002",
+      "category": "accounting",
+      "input": {
+        "source_amount_atomic": "1000",
+        "allocations_atomic": [
+          "600",
+          "500"
+        ]
+      },
+      "expected": "reject_non_conserving_allocation",
+      "reason": "Allocation totals must conserve the source amount using checked integer arithmetic."
+    },
+    {
+      "id": "GATE-001",
+      "category": "economic_gate",
+      "input": {
+        "required_gateway_statuses": [
+          "PASS",
+          "STALE",
+          "PASS",
+          "PASS"
+        ]
+      },
+      "expected": "aggregate_not_pass",
+      "reason": "A stale required gateway must prevent an aggregate PASS."
+    },
+    {
+      "id": "GATE-002",
+      "category": "economic_gate",
+      "input": {
+        "http_status": 200,
+        "body_status": "REVIEW_REQUIRED"
+      },
+      "expected": "preserve_review_required",
+      "reason": "HTTP success does not override the semantic status returned by an economic gateway."
+    },
+    {
+      "id": "REL-001",
+      "category": "release_policy",
+      "input": {
+        "testnet_checks_pass": true,
+        "mainnet_approval": false
+      },
+      "expected": "block_mainnet_release",
+      "reason": "Testnet success is not authorization to deploy or write to Mainnet."
     }
   ],
   "limitations": [
