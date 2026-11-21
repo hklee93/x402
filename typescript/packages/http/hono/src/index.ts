@@ -8,6 +8,7 @@ import {
   FacilitatorClient,
   FacilitatorResponseError,
   getFacilitatorResponseError,
+  prepareHttpServer,
   SETTLEMENT_OVERRIDES_HEADER,
   SettlementOverrides,
   checkIfBazaarNeeded,
@@ -15,6 +16,7 @@ import {
 } from "@x402/core/server";
 import { SchemeNetworkServer, Network } from "@x402/core/types";
 import { Context, MiddlewareHandler } from "hono";
+import { basePath } from "hono/route";
 import { HonoAdapter } from "./adapter";
 
 /**
@@ -67,6 +69,37 @@ function internalErrorResponse(c: Context, error: unknown): Response {
 }
 
 /**
+ * Decode `c.req.path` and strip the Hono `basePath` mount prefix.
+ *
+ * @param c - Hono context
+ * @returns Decoded path relative to the app mount
+ */
+function decodedRoutePath(c: Context): string {
+  let path: string;
+  try {
+    path = decodeURIComponent(c.req.path);
+  } catch {
+    path = c.req.path;
+  }
+  let rootPath = "";
+  try {
+    rootPath = basePath(c);
+  } catch {
+    return path;
+  }
+  if (!rootPath || rootPath === "/" || !path.startsWith(rootPath)) {
+    return path;
+  }
+  if (path === rootPath) {
+    return "";
+  }
+  if (path[rootPath.length] === "/") {
+    return path.slice(rootPath.length);
+  }
+  return path;
+}
+
+/**
  * Hono payment middleware for x402 protocol (direct HTTP server instance).
  *
  * Use this when you need to configure HTTP-level hooks.
@@ -96,41 +129,11 @@ export function paymentMiddlewareFromHTTPServer(
   paywall?: PaywallProvider,
   syncFacilitatorOnStart: boolean = true,
 ): MiddlewareHandler {
-  // Register custom paywall provider if provided
-  if (paywall) {
-    httpServer.registerPaywallProvider(paywall);
-  }
-
-  // Store initialization promise (not the result)
-  // httpServer.initialize() fetches facilitator support and validates routes
-  let initPromise: Promise<void> | null = syncFacilitatorOnStart ? httpServer.initialize() : null;
-  // Attach a no-op rejection handler so an early failure (e.g. a facilitator
-  // request timeout) cannot become an unhandled rejection before the first
-  // protected request awaits initPromise. The original promise is kept, so that
-  // request still observes the failure and triggers the retry path.
-  void initPromise?.catch(() => {});
-  let isInitialized = false;
-
-  /**
-   * Ensures facilitator initialization succeeds once, while allowing retries after failures.
-   */
-  async function initializeHttpServer(): Promise<void> {
-    if (!syncFacilitatorOnStart || isInitialized) {
-      return;
-    }
-
-    if (!initPromise) {
-      initPromise = httpServer.initialize();
-    }
-
-    try {
-      await initPromise;
-      isInitialized = true;
-    } catch (error) {
-      initPromise = null;
-      throw error;
-    }
-  }
+  const { init: initializeHttpServer } = prepareHttpServer(
+    httpServer,
+    paywall,
+    syncFacilitatorOnStart,
+  );
 
   let bazaarPromise: Promise<void> | null = null;
   if (checkIfBazaarNeeded(httpServer.routes)) {
@@ -154,9 +157,11 @@ export function paymentMiddlewareFromHTTPServer(
   return async (c: Context, next: () => Promise<void>) => {
     // Create adapter and context
     const adapter = new HonoAdapter(c);
+    const path = c.req.path;
     const context: HTTPRequestContext = {
       adapter,
-      path: c.req.path,
+      path,
+      decodedPath: decodedRoutePath(c),
       method: c.req.method,
       paymentHeader: adapter.getHeader("payment-signature") || adapter.getHeader("x-payment"),
     };
@@ -167,7 +172,7 @@ export function paymentMiddlewareFromHTTPServer(
     }
 
     // Only initialize when processing a protected route
-    if (syncFacilitatorOnStart && !isInitialized) {
+    if (syncFacilitatorOnStart) {
       try {
         await initializeHttpServer();
       } catch (error) {
@@ -275,18 +280,18 @@ export function paymentMiddlewareFromHTTPServer(
           return;
         }
 
-        // Get response body for extensions
-        const responseBody = Buffer.from(await res.clone().arrayBuffer());
-
-        const responseHeaders: Record<string, string> = {};
-        res.headers.forEach((value, key) => {
-          responseHeaders[key] = value;
-        });
-
         // Clear the response so we can modify headers
         c.res = undefined;
 
         try {
+          // Get response body for extensions
+          const responseBody = Buffer.from(await res.arrayBuffer());
+
+          const responseHeaders: Record<string, string> = {};
+          res.headers.forEach((value, key) => {
+            responseHeaders[key] = value;
+          });
+
           const settleResult = await httpServer.processSettlement(
             paymentPayload,
             paymentRequirements,
@@ -307,6 +312,8 @@ export function paymentMiddlewareFromHTTPServer(
               headers: response.headers,
             });
           } else {
+            res = new Response(responseBody, { status: res.status, headers: res.headers });
+            res.headers.delete("transfer-encoding");
             // Settlement succeeded - add headers to response
             Object.entries(settleResult.headers).forEach(([key, value]) => {
               res.headers.set(key, value);

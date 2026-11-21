@@ -26,7 +26,8 @@ import {
 } from "../../constants";
 import * as Errors from "./errors";
 import { FacilitatorEvmSigner } from "../../signer";
-import { ExactPermit2Payload } from "../../types";
+import { ExactPermit2Payload, isUint256DecimalString } from "../../types";
+import { startAssetContractCheck } from "../../assetCache";
 import { finalHashFromTwoRequestSend, getEvmChainId, isValidTxHash } from "../../utils";
 import { validateErc20ApprovalForPayment } from "./erc20approval";
 import { verifyTypedDataSignature } from "../../shared/verifySignature";
@@ -112,10 +113,8 @@ export async function verifyPermit2(
   const chainId = getEvmChainId(requirements.network);
   const tokenAddress = getAddress(requirements.asset);
 
-  const assetBytecode = await signer.getCode({ address: tokenAddress });
-  if (!assetBytecode || assetBytecode === "0x") {
-    return { isValid: false, invalidReason: Errors.ErrAssetNotDeployedContract, payer };
-  }
+  // Run the asset-contract check concurrently with the signature check below.
+  const assetCheck = startAssetContractCheck(signer, requirements.network, requirements.asset);
 
   if (
     getAddress(permit2Payload.permit2Authorization.spender) !==
@@ -155,7 +154,13 @@ export async function verifyPermit2(
     };
   }
 
-  // Verify amount exactly matches requirements
+  if (!isUint256DecimalString(requirements.amount)) {
+    return {
+      isValid: false,
+      invalidReason: Errors.ErrInvalidRequiredAmount,
+      payer,
+    };
+  }
   if (
     BigInt(permit2Payload.permit2Authorization.permitted.amount) !== BigInt(requirements.amount)
   ) {
@@ -208,6 +213,12 @@ export async function verifyPermit2(
     ...permit2TypedData,
     signature: permit2Payload.signature,
   });
+
+  const assetReason = await assetCheck.await();
+  if (assetReason) {
+    return { isValid: false, invalidReason: assetReason, payer };
+  }
+
   if (!signatureValid) {
     return {
       isValid: false,
@@ -385,6 +396,7 @@ export async function settlePermit2(
       network: payload.accepted.network,
       transaction: "",
       errorReason: valid.invalidReason ?? Errors.ErrInvalidScheme,
+      errorMessage: valid.invalidMessage,
       payer,
     };
   }

@@ -13,7 +13,7 @@ import {
   type SearchDiscoveryResourcesParams,
   type SearchDiscoveryResourcesResponse,
 } from "../src/bazaar/facilitatorClient";
-import { HTTPFacilitatorClient } from "@x402/core/http";
+import { FacilitatorTimeoutError, HTTPFacilitatorClient } from "@x402/core/http";
 
 describe("Bazaar Client Extension - facilitatorClient", () => {
   describe("Type definitions", () => {
@@ -227,10 +227,7 @@ describe("Bazaar Client Extension - facilitatorClient", () => {
           pagination: { limit: 20, offset: 0, total: 0 },
         };
 
-        mockFetch.mockResolvedValue({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        });
+        mockFetch.mockResolvedValue(new Response(JSON.stringify(mockResponse), { status: 200 }));
 
         const facilitatorClient = new HTTPFacilitatorClient({
           url: "https://x402.org/facilitator",
@@ -253,10 +250,7 @@ describe("Bazaar Client Extension - facilitatorClient", () => {
           pagination: { limit: 10, offset: 5, total: 100 },
         };
 
-        mockFetch.mockResolvedValue({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        });
+        mockFetch.mockResolvedValue(new Response(JSON.stringify(mockResponse), { status: 200 }));
 
         const facilitatorClient = new HTTPFacilitatorClient({
           url: "https://x402.org/facilitator",
@@ -331,10 +325,7 @@ describe("Bazaar Client Extension - facilitatorClient", () => {
           },
         };
 
-        mockFetch.mockResolvedValue({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        });
+        mockFetch.mockResolvedValue(new Response(JSON.stringify(mockResponse), { status: 200 }));
 
         const facilitatorClient = new HTTPFacilitatorClient({
           url: "https://x402.org/facilitator",
@@ -354,6 +345,37 @@ describe("Bazaar Client Extension - facilitatorClient", () => {
       });
     });
 
+    it("rejects a discovery body over the 4 MiB limit", async () => {
+      const oversized = JSON.stringify({ items: "a".repeat(4 * 1024 * 1024) });
+      mockFetch.mockResolvedValue(new Response(oversized, { status: 200 }));
+
+      const extendedClient = withBazaar(
+        new HTTPFacilitatorClient({ url: "https://x402.org/facilitator" }),
+      );
+
+      await expect(extendedClient.extensions.bazaar.listResources()).rejects.toThrow(
+        /http response body too large/,
+      );
+    });
+
+    it("aborts discovery requests after the client's timeoutMs", async () => {
+      mockFetch.mockImplementation(
+        (_url: string, init: RequestInit) =>
+          new Promise((_resolve, reject) =>
+            init.signal?.addEventListener("abort", () => reject(init.signal?.reason)),
+          ),
+      );
+
+      const { bazaar } = withBazaar(
+        new HTTPFacilitatorClient({ url: "https://x402.org/facilitator", timeoutMs: 20 }),
+      ).extensions;
+
+      await expect(bazaar.listResources()).rejects.toBeInstanceOf(FacilitatorTimeoutError);
+      await expect(bazaar.search({ query: "weather" })).rejects.toBeInstanceOf(
+        FacilitatorTimeoutError,
+      );
+    });
+
     describe("search", () => {
       it("should call correct endpoint with required query param", async () => {
         const mockResponse: SearchDiscoveryResourcesResponse = {
@@ -361,10 +383,7 @@ describe("Bazaar Client Extension - facilitatorClient", () => {
           resources: [],
         };
 
-        mockFetch.mockResolvedValue({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        });
+        mockFetch.mockResolvedValue(new Response(JSON.stringify(mockResponse), { status: 200 }));
 
         const facilitatorClient = new HTTPFacilitatorClient({
           url: "https://x402.org/facilitator",
@@ -390,10 +409,7 @@ describe("Bazaar Client Extension - facilitatorClient", () => {
           pagination: { limit: 10, cursor: "eyJwYWdlIjoyfQ==" },
         };
 
-        mockFetch.mockResolvedValue({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        });
+        mockFetch.mockResolvedValue(new Response(JSON.stringify(mockResponse), { status: 200 }));
 
         const facilitatorClient = new HTTPFacilitatorClient({
           url: "https://x402.org/facilitator",
@@ -454,10 +470,7 @@ describe("Bazaar Client Extension - facilitatorClient", () => {
           pagination: { limit: 10, cursor: "nextPageToken" },
         };
 
-        mockFetch.mockResolvedValue({
-          ok: true,
-          json: () => Promise.resolve(mockResponse),
-        });
+        mockFetch.mockResolvedValue(new Response(JSON.stringify(mockResponse), { status: 200 }));
 
         const facilitatorClient = new HTTPFacilitatorClient({
           url: "https://x402.org/facilitator",

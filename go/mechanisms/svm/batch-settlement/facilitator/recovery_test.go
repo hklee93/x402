@@ -1,0 +1,1831 @@
+package facilitator
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	bin "github.com/gagliardetto/binary"
+	solana "github.com/gagliardetto/solana-go"
+	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/stretchr/testify/require"
+
+	x402 "github.com/x402-foundation/x402/go/v2"
+	"github.com/x402-foundation/x402/go/v2/mechanisms/svm"
+	batchsettlement "github.com/x402-foundation/x402/go/v2/mechanisms/svm/batch-settlement"
+	"github.com/x402-foundation/x402/go/v2/mechanisms/svm/paymentchannels"
+	"github.com/x402-foundation/x402/go/v2/mechanisms/svm/paymentchannels/generated"
+	"github.com/x402-foundation/x402/go/v2/types"
+)
+
+func TestBatchSettlementOutcomeRecovery(t *testing.T) {
+	network := string(svm.SolanaDevnetCAIP2)
+	mint := svm.USDCDevnetAddress
+	receiver := svm.USDCMainnetAddress
+	txSig := solana.Signature{7}
+	tx := txSig.String()
+	payer := mustKey(t)
+	feePayer := mustKey(t)
+	channelID := svm.USDCMainnetAddress
+	channelConfig := batchsettlement.BatchChannelConfig{
+		OpenSlot:           1,
+		Payer:              payer.PublicKey().String(),
+		PayerAuthorizer:    payer.PublicKey().String(),
+		Receiver:           receiver,
+		ReceiverAuthorizer: receiver,
+		Salt:               "0",
+		Token:              mint,
+		WithdrawDelay:      900,
+	}
+	terms := BatchTerms{
+		FeePayer:           feePayer.PublicKey().String(),
+		ReceiverAuthorizer: receiver,
+		TokenProgram:       svm.TokenProgramAddress,
+		VoucherSigner:      batchsettlement.VoucherSignerClient,
+		WithdrawDelay:      900,
+	}
+	requirements := types.PaymentRequirements{
+		Amount: "1000",
+		Asset:  mint,
+		Extra: map[string]any{
+			"feePayer":           feePayer.PublicKey().String(),
+			"receiverAuthorizer": receiver,
+			"tokenProgram":       svm.TokenProgramAddress,
+			"withdrawDelay":      900,
+		},
+		MaxTimeoutSeconds: 300,
+		Network:           network,
+		PayTo:             receiver,
+		Scheme:            batchsettlement.Scheme,
+	}
+	hash, err := paymentchannels.GetChannelDistributionHash([]paymentchannels.Split{{
+		Recipient: receiver, BPS: batchsettlement.FullSplitBPS,
+	}})
+	require.NoError(t, err)
+
+	channel := func(overrides func(*generated.Channel)) *generated.Channel {
+		ch := &generated.Channel{
+			Discriminator:    uint8(generated.AccountDiscriminator_Channel),
+			Bump:             1,
+			Version:          1,
+			Status:           uint8(generated.ChannelStatus_Open),
+			Salt:             0,
+			Deposit:          10_000,
+			Settlement:       generated.SettlementWatermarks{},
+			GracePeriod:      900,
+			DistributionHash: hash,
+			Payer:            payer.PublicKey(),
+			Payee:            feePayer.PublicKey(),
+			AuthorizedSigner: payer.PublicKey(),
+			Mint:             solana.MustPublicKeyFromBase58(mint),
+			RentPayer:        feePayer.PublicKey(),
+			OpenSlot:         1,
+		}
+		if overrides != nil {
+			overrides(ch)
+		}
+		return ch
+	}
+	encodeChannel := func(t *testing.T, ch *generated.Channel) []byte {
+		t.Helper()
+		buf := new(bytes.Buffer)
+		require.NoError(t, ch.MarshalWithEncoder(bin.NewBorshEncoder(buf)))
+		return buf.Bytes()
+	}
+	payoutEvidence := func(t *testing.T, before, after string) *svm.FacilitatorConfirmedTransaction {
+		t.Helper()
+		tokenProgram := solana.MustPublicKeyFromBase58(svm.TokenProgramAddress)
+		mintKey := solana.MustPublicKeyFromBase58(mint)
+		recipient, err := paymentchannels.FindATA(solana.MustPublicKeyFromBase58(receiver), mintKey, tokenProgram)
+		require.NoError(t, err)
+		escrow, err := paymentchannels.FindATA(solana.MustPublicKeyFromBase58(channelID), mintKey, tokenProgram)
+		require.NoError(t, err)
+		token := func(index int, owner, amount string) svm.FacilitatorTokenBalance {
+			return svm.FacilitatorTokenBalance{
+				AccountIndex:  index,
+				Mint:          mint,
+				Owner:         owner,
+				UITokenAmount: svm.FacilitatorTokenAmount{Amount: amount},
+			}
+		}
+		return &svm.FacilitatorConfirmedTransaction{
+			Slot:        100,
+			AccountKeys: []string{recipient.String(), escrow.String()},
+			Meta: &svm.FacilitatorConfirmedMeta{
+				PreTokenBalances:  []svm.FacilitatorTokenBalance{token(0, receiver, before), token(1, channelID, "9800")},
+				PostTokenBalances: []svm.FacilitatorTokenBalance{token(0, receiver, after), token(1, channelID, "9000")},
+			},
+		}
+	}
+	claimPayload := func(t *testing.T, amount uint64) batchsettlement.BatchClaimPayload {
+		t.Helper()
+		sig, err := paymentchannels.SignVoucher(context.Background(), ed25519Signer{payer}, solana.MustPublicKeyFromBase58(channelID), amount, 0)
+		require.NoError(t, err)
+		return batchsettlement.BatchClaimPayload{
+			Type: batchsettlement.PayloadTypeClaim,
+			Claims: []batchsettlement.BatchVoucherClaim{{
+				ChannelID:     channelID,
+				ChannelConfig: channelConfig,
+				Voucher: batchsettlement.BatchVoucher{
+					ChannelID:          channelID,
+					ExpiresAt:          0,
+					MaxClaimableAmount: strconv.FormatUint(amount, 10),
+					Signature:          sig,
+				},
+			}},
+		}
+	}
+	configure := func(scheme *BatchSvmScheme) {
+		scheme.hooks.resolveTerms = func(context.Context, batchsettlement.BatchChannelConfig, types.PaymentRequirements, VoucherModeBinding) (BatchTerms, error) {
+			return terms, nil
+		}
+		scheme.hooks.deriveChannelID = func(context.Context, batchsettlement.BatchChannelConfig, string) (string, error) {
+			return channelID, nil
+		}
+		scheme.hooks.distributeInstruction = func(context.Context, string, *generated.Channel, BatchTerms, types.PaymentRequirements) (solana.Instruction, error) {
+			return solana.NewInstruction(solana.MustPublicKeyFromBase58(receiver), nil, []byte{7}), nil
+		}
+	}
+	closeTx, err := solana.NewTransaction(
+		[]solana.Instruction{solana.NewInstruction(solana.MustPublicKeyFromBase58(svm.MemoProgramAddress), nil, []byte{1})},
+		solana.MustHashFromBase58("11111111111111111111111111111111"),
+		solana.TransactionPayer(feePayer.PublicKey()),
+	)
+	require.NoError(t, err)
+	closeWire, err := svm.EncodeTransaction(closeTx)
+	require.NoError(t, err)
+	closeHash, err := svm.MessageHash(closeTx)
+	require.NoError(t, err)
+	refundKey := "batch:refund:" + network + ":" + channelID + ":" + closeHash
+	stubPrepareRefund := func(scheme *BatchSvmScheme) {
+		scheme.hooks.sealDependencies = func() SealDependencies {
+			deps := scheme.defaultSealDependencies()
+			deps.PrepareRefund = func(context.Context, batchsettlement.BatchRefundPayload, types.PaymentRequirements, RefundLimits, any) (PreparedRefund, error) {
+				return PreparedRefund{ChannelID: channelID, RequestClose: closeWire, Terms: terms}, nil
+			}
+			return deps
+		}
+	}
+	newScheme := func(t *testing.T, signer svm.FacilitatorSvmSigner, store x402.PendingSettlementStore, onDist OnDistributionConfirmed) *BatchSvmScheme {
+		t.Helper()
+		cfg := &Config{}
+		if store != nil {
+			cfg.PendingSettlementStore = store
+		}
+		if onDist != nil {
+			cfg.OnDistributionConfirmed = onDist
+		}
+		return NewBatchSvmScheme(context.Background(), signer, cfg)
+	}
+	confirming := func(t *testing.T, slot uint64, confirmErr error) *confirmingSigner {
+		t.Helper()
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		inner.confirmErr = confirmErr
+		return &confirmingSigner{scriptedSigner: inner, slot: slot}
+	}
+	t.Run("answers a repeated claim at the channel watermark with the channel state, without broadcasting or writing a lifecycle record", func(t *testing.T) {
+		payload := claimPayload(t, 1000)
+		storage := newActivityRecordingStorage()
+		signer := confirming(t, 0, nil)
+		scheme := newScheme(t, signer, nil, nil)
+		scheme.channelStorage = storage
+		configure(scheme)
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) {
+				ch.Settlement = generated.SettlementWatermarks{Settled: 1000}
+			}), nil
+		}
+		var submitCalls atomic.Int32
+		scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			submitCalls.Add(1)
+			return durableResult{}, errors.New("should not submit")
+		}
+		response, err := scheme.settleClaims(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.False(t, response.Success)
+		require.Equal(t, batchsettlement.ErrCumulativeAmountMismatch, response.ErrorReason)
+		require.Empty(t, response.Transaction)
+		require.Equal(t, map[string]any{batchsettlement.ExtraChannelStates: []batchsettlement.BatchRedemptionChannelState{{
+			ChannelID: channelID, Status: batchsettlement.ChannelStatusOpen, Balance: "10000", TotalClaimed: "1000", PayoutWatermark: "0",
+		}}}, response.Extra)
+		require.Zero(t, storage.activityCalls.Load())
+		require.Zero(t, submitCalls.Load())
+		require.Empty(t, signer.confirmCalls())
+		require.Empty(t, signer.sentTransactions())
+	})
+
+	t.Run("rejects a claim whose cumulative amount exceeds the deposit before broadcasting", func(t *testing.T) {
+		payload := claimPayload(t, 20_000)
+		scheme := newScheme(t, confirming(t, 0, nil), nil, nil)
+		configure(scheme)
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(nil), nil
+		}
+		var submitCalls atomic.Int32
+		scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			submitCalls.Add(1)
+			return durableResult{}, errors.New("should not submit")
+		}
+		_, err := scheme.settleClaims(context.Background(), payload, requirements)
+		require.ErrorContains(t, err, batchsettlement.ErrCumulativeAmountMismatch)
+		require.Zero(t, submitCalls.Load())
+	})
+
+	t.Run("constrains post-confirmation reads to the transaction slot and retries a lagging RPC", func(t *testing.T) {
+		store := x402.NewInMemoryPendingSettlementStore()
+		key := "batch:claim:" + network + ":" + channelID + ":1000"
+		require.NoError(t, store.Set(context.Background(), key, tx))
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		var accountMu sync.Mutex
+		var accountCalls []accountCall
+		var accountAttempts atomic.Int32
+		encoded := encodeChannel(t, channel(func(ch *generated.Channel) {
+			ch.Settlement = generated.SettlementWatermarks{Settled: 1000}
+		}))
+		signer := &slotAccountSigner{
+			confirmingSigner: &confirmingSigner{scriptedSigner: inner, slot: 321},
+			getAccount: func(_ context.Context, account solana.PublicKey, _ string, opts *rpc.GetAccountInfoOpts) (*rpc.GetAccountInfoResult, error) {
+				accountMu.Lock()
+				accountCalls = append(accountCalls, accountCall{account: account, opts: opts})
+				accountMu.Unlock()
+				if accountAttempts.Add(1) == 1 {
+					return nil, errors.New("Minimum context slot has not been reached")
+				}
+				return &rpc.GetAccountInfoResult{Value: &rpc.Account{Data: rpc.DataBytesOrJSONFromBytes(encoded)}}, nil
+			},
+		}
+		scheme := newScheme(t, signer, store, nil)
+		configure(scheme)
+		scheme.hooks.waitForChannelRead = func(int) error { return nil }
+		payload := claimPayload(t, 1000)
+		response, err := scheme.settleClaims(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.True(t, response.Success)
+		require.Equal(t, tx, response.Transaction)
+		accountMu.Lock()
+		defer accountMu.Unlock()
+		require.Len(t, accountCalls, 2)
+		for _, call := range accountCalls {
+			require.NotNil(t, call.opts)
+			require.Equal(t, rpc.CommitmentConfirmed, call.opts.Commitment)
+			require.NotNil(t, call.opts.MinContextSlot)
+			require.Equal(t, uint64(321), *call.opts.MinContextSlot)
+		}
+	})
+
+	t.Run("keeps unknown transactions pending and never rebroadcasts", func(t *testing.T) {
+		store := x402.NewInMemoryPendingSettlementStore()
+		signature := txSig
+		key := "batch:claim:" + network + ":" + channelID + ":1000"
+		require.NoError(t, store.Set(context.Background(), key, signature.String()))
+		signer := confirming(t, 0, errors.New("history unavailable"))
+		scheme := newScheme(t, signer, store, nil)
+		configure(scheme)
+		var submitCalls atomic.Int32
+		scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			submitCalls.Add(1)
+			return durableResult{}, errors.New("should not submit")
+		}
+		payload := claimPayload(t, 1000)
+		for i := 0; i < 2; i++ {
+			response, err := scheme.settleClaims(context.Background(), payload, requirements)
+			require.NoError(t, err)
+			require.False(t, response.Success)
+			require.Equal(t, signature.String(), response.Transaction)
+			require.Equal(t, x402.ErrSettlementPending, response.ErrorReason)
+		}
+		got, ok, err := store.Get(context.Background(), key)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, signature.String(), got)
+		require.Zero(t, submitCalls.Load())
+		require.Empty(t, signer.sentTransactions())
+	})
+
+	t.Run("retries a stale claim read after confirmation", func(t *testing.T) {
+		scheme := newScheme(t, confirming(t, 0, nil), nil, nil)
+		configure(scheme)
+		var reads atomic.Int32
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			n := reads.Add(1)
+			if n <= 2 {
+				return channel(nil), nil
+			}
+			return channel(func(ch *generated.Channel) {
+				ch.Settlement = generated.SettlementWatermarks{Settled: 1_000}
+			}), nil
+		}
+		var submits atomic.Int32
+		scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			submits.Add(1)
+			return durableResult{OK: true, Signature: tx}, nil
+		}
+		scheme.hooks.waitForChannelRead = func(int) error { return nil }
+		payload := claimPayload(t, 1000)
+		response, err := scheme.settleClaims(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.True(t, response.Success)
+		require.Equal(t, tx, response.Transaction)
+		extra := asMap(t, response.Extra)
+		accepts, ok := extra["accepts"].([]any)
+		require.True(t, ok)
+		require.Len(t, accepts, 1)
+		accept := asMap(t, accepts[0])
+		require.Equal(t, channelID, accept["channelId"])
+		require.Equal(t, "1000", accept["totalClaimed"])
+		require.Equal(t, int32(3), reads.Load())
+		require.Equal(t, int32(1), submits.Load())
+	})
+
+	t.Run("recovers a lost claim response after restart and never credits an unrelated watermark", func(t *testing.T) {
+		payload := claimPayload(t, 1000)
+		key := "batch:claim:" + network + ":" + channelID + ":1000"
+		store := x402.NewInMemoryPendingSettlementStore()
+		require.NoError(t, store.Set(context.Background(), key, tx))
+		recoveringSigner := confirming(t, 1, nil)
+		recovering := newScheme(t, recoveringSigner, store, nil)
+		configure(recovering)
+		recovering.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) {
+				ch.Settlement = generated.SettlementWatermarks{Settled: 1_000}
+			}), nil
+		}
+		var recoverySubmits atomic.Int32
+		recovering.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			recoverySubmits.Add(1)
+			return durableResult{}, errors.New("should not submit")
+		}
+		recovered, err := recovering.settleClaims(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.True(t, recovered.Success)
+		require.Equal(t, tx, recovered.Transaction)
+		require.Len(t, recoveringSigner.confirmCalls(), 1)
+		require.Zero(t, recoverySubmits.Load())
+		_, ok, err := store.Get(context.Background(), key)
+		require.NoError(t, err)
+		require.False(t, ok)
+
+		restarted := newScheme(t, confirming(t, 0, nil), store, nil)
+		configure(restarted)
+		var restartedSubmits atomic.Int32
+		restarted.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) {
+				ch.Settlement = generated.SettlementWatermarks{Settled: 1_000}
+			}), nil
+		}
+		restarted.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			restartedSubmits.Add(1)
+			return durableResult{}, errors.New("should not submit")
+		}
+		replayed, err := restarted.settleClaims(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.False(t, replayed.Success)
+		require.Equal(t, batchsettlement.ErrCumulativeAmountMismatch, replayed.ErrorReason)
+		require.Contains(t, replayed.Extra, batchsettlement.ExtraChannelStates)
+		require.Zero(t, restartedSubmits.Load())
+	})
+
+	t.Run("does not delete a successor transaction when an older completion finishes late", func(t *testing.T) {
+		store := x402.NewInMemoryPendingSettlementStore()
+		require.NoError(t, store.Set(context.Background(), "key", "successor"))
+		scheme := newScheme(t, confirming(t, 0, nil), store, nil)
+		configure(scheme)
+		scheme.forgetPending(context.Background(), "key", tx)
+		got, ok, err := store.Get(context.Background(), "key")
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, "successor", got)
+	})
+
+	t.Run("reports the onchain payout watermark of a recovered sweep that a later claim has passed", func(t *testing.T) {
+		payload := batchsettlement.BatchSettlePayload{
+			Type:     batchsettlement.PayloadTypeSettle,
+			Channels: []batchsettlement.BatchSettleChannel{{ChannelID: channelID, ChannelConfig: channelConfig}},
+		}
+		key := "batch:distribute:" + network + ":" + channelID
+		store := x402.NewInMemoryPendingSettlementStore()
+		require.NoError(t, store.Set(context.Background(), key, tx))
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		signer := &capabilitySigner{
+			scriptedSigner: inner,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				return payoutEvidence(t, "200", "1200"), nil
+			},
+		}
+		scheme := newScheme(t, signer, store, nil)
+		configure(scheme)
+		// The timed-out sweep paid up to 1000; a claim then settled up to 3000.
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) {
+				ch.Settlement = generated.SettlementWatermarks{Settled: 3000, PayoutWatermark: 1000}
+			}), nil
+		}
+		scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			return durableResult{}, errors.New("should not submit")
+		}
+		response, err := scheme.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.True(t, response.Success)
+		require.Equal(t, "1000", response.Amount)
+		require.Equal(t, []batchsettlement.BatchRedemptionChannelState{{
+			ChannelID: channelID, Status: batchsettlement.ChannelStatusOpen, Balance: "10000", TotalClaimed: "3000", PayoutWatermark: "1000",
+		}}, response.Extra[batchsettlement.ExtraChannelStates], "the unpaid 2000 must stay unpaid in the reported state")
+
+		t.Run("answers without channel states when the channel cannot be read after the recovery", func(t *testing.T) {
+			require.NoError(t, store.Set(context.Background(), key, tx))
+			var reads atomic.Int32
+			scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+				if reads.Add(1) == 1 {
+					return channel(func(ch *generated.Channel) {
+						ch.Settlement = generated.SettlementWatermarks{Settled: 3000, PayoutWatermark: 1000}
+					}), nil
+				}
+				return nil, errors.New("rpc unavailable")
+			}
+			recovered, err := scheme.settleDistributions(context.Background(), payload, requirements)
+			require.NoError(t, err)
+			require.True(t, recovered.Success)
+			require.Equal(t, "1000", recovered.Amount)
+			require.Equal(t, tx, recovered.Transaction)
+			require.NotContains(t, recovered.Extra, batchsettlement.ExtraChannelStates, "the pre-recovery read cannot describe the recovered sweep")
+			_, ok, err := store.Get(context.Background(), key)
+			require.NoError(t, err)
+			require.False(t, ok, "the confirmed sweep is not retried")
+		})
+	})
+
+	t.Run("attributes a confirmed close to the receiver payout and the payer refund", func(t *testing.T) {
+		tokenProgram := solana.MustPublicKeyFromBase58(svm.TokenProgramAddress)
+		mintKey := solana.MustPublicKeyFromBase58(mint)
+		receiverATA, err := paymentchannels.FindATA(solana.MustPublicKeyFromBase58(receiver), mintKey, tokenProgram)
+		require.NoError(t, err)
+		payerATA, err := paymentchannels.FindATA(payer.PublicKey(), mintKey, tokenProgram)
+		require.NoError(t, err)
+		balance := func(index int, owner, amount string) svm.FacilitatorTokenBalance {
+			return svm.FacilitatorTokenBalance{AccountIndex: index, Mint: mint, Owner: owner, UITokenAmount: svm.FacilitatorTokenAmount{Amount: amount}}
+		}
+		evidence := &svm.FacilitatorConfirmedTransaction{
+			Slot:        100,
+			AccountKeys: []string{receiverATA.String(), payerATA.String()},
+			Meta: &svm.FacilitatorConfirmedMeta{
+				PreTokenBalances:  []svm.FacilitatorTokenBalance{balance(0, receiver, "200"), balance(1, payer.PublicKey().String(), "50")},
+				PostTokenBalances: []svm.FacilitatorTokenBalance{balance(0, receiver, "2700"), balance(1, payer.PublicKey().String(), "7050")},
+			},
+		}
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		signer := &capabilitySigner{
+			scriptedSigner: inner,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				return evidence, nil
+			},
+		}
+		scheme := newScheme(t, signer, x402.NewInMemoryPendingSettlementStore(), nil)
+		scheme.hooks.waitForChannelRead = func(int) error { return nil }
+		attribution, err := scheme.attributeClose(context.Background(), tx, requirements, terms, payer.PublicKey().String())
+		require.NoError(t, err)
+		require.Equal(t, CloseAttribution{PaidToReceiver: 2_500, RefundedToPayer: 7_000}, attribution)
+
+		own := requirements
+		own.PayTo = payer.PublicKey().String()
+		_, err = scheme.attributeClose(context.Background(), tx, own, terms, payer.PublicKey().String())
+		var ambiguous *PayoutAttributionAmbiguousError
+		require.ErrorAs(t, err, &ambiguous, "a receiver that is also the payer shares its token account")
+
+		evidence.AccountKeys = []string{receiverATA.String()}
+		_, err = scheme.attributeClose(context.Background(), tx, requirements, terms, payer.PublicKey().String())
+		require.ErrorAs(t, err, &ambiguous, "no retry adds the payer's token account to a confirmed transaction")
+		require.ErrorContains(t, err, "payer refund")
+
+		evidence.Meta = nil
+		_, err = scheme.attributeClose(context.Background(), tx, requirements, terms, payer.PublicKey().String())
+		require.Error(t, err)
+		require.False(t, errors.As(err, &ambiguous), "metadata that is not visible yet may still appear")
+	})
+
+	t.Run("fails a recovered sweep whose confirmed transaction does not carry the recipient's balance", func(t *testing.T) {
+		payload := batchsettlement.BatchSettlePayload{
+			Type:     batchsettlement.PayloadTypeSettle,
+			Channels: []batchsettlement.BatchSettleChannel{{ChannelID: channelID, ChannelConfig: channelConfig}},
+		}
+		key := "batch:distribute:" + network + ":" + channelID
+		store := x402.NewInMemoryPendingSettlementStore()
+		require.NoError(t, store.Set(context.Background(), key, tx))
+		evidence := payoutEvidence(t, "200", "1200")
+		evidence.AccountKeys[0] = feePayer.String()
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		signer := &capabilitySigner{
+			scriptedSigner: inner,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				return evidence, nil
+			},
+		}
+		scheme := newScheme(t, signer, store, nil)
+		configure(scheme)
+		scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			return durableResult{}, errors.New("should not submit")
+		}
+		response, err := scheme.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.False(t, response.Success)
+		require.Equal(t, batchsettlement.ErrPayoutAttributionAmbiguous, response.ErrorReason)
+		require.Equal(t, tx, response.Transaction)
+		_, ok, err := store.Get(context.Background(), key)
+		require.NoError(t, err)
+		require.False(t, ok, "an unattributable sweep is not retried forever")
+	})
+
+	t.Run("recovers the actual payout after a lost response and restart without changing the request", func(t *testing.T) {
+		payload := batchsettlement.BatchSettlePayload{
+			Type:     batchsettlement.PayloadTypeSettle,
+			Channels: []batchsettlement.BatchSettleChannel{{ChannelID: channelID, ChannelConfig: channelConfig}},
+		}
+		key := "batch:distribute:" + network + ":" + channelID
+		store := x402.NewInMemoryPendingSettlementStore()
+		require.NoError(t, store.Set(context.Background(), key, tx))
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		firstSigner := &capabilitySigner{
+			scriptedSigner: inner,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				return payoutEvidence(t, "200", "1700"), nil
+			},
+		}
+		var recorded atomic.Int32
+		record := func(context.Context, *x402.SettleResponse, types.PaymentRequirements) error {
+			recorded.Add(1)
+			return nil
+		}
+		first := newScheme(t, firstSigner, store, record)
+		configure(first)
+		first.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) {
+				ch.Settlement = generated.SettlementWatermarks{Settled: 1700, PayoutWatermark: 1700}
+			}), nil
+		}
+		var firstSubmits atomic.Int32
+		first.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			firstSubmits.Add(1)
+			return durableResult{}, errors.New("should not submit")
+		}
+		response, err := first.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		paidOut := []batchsettlement.BatchRedemptionChannelState{{
+			ChannelID: channelID, Status: batchsettlement.ChannelStatusOpen, Balance: "10000", TotalClaimed: "1700", PayoutWatermark: "1700",
+		}}
+		require.Equal(t, &x402.SettleResponse{
+			Amount:      "1500",
+			Extra:       map[string]any{"channels": []string{channelID}, batchsettlement.ExtraChannelStates: paidOut},
+			Network:     x402.Network(network),
+			Payer:       "",
+			Success:     true,
+			Transaction: tx,
+		}, response)
+		require.Zero(t, firstSubmits.Load())
+		_, ok, err := store.Get(context.Background(), key)
+		require.NoError(t, err)
+		require.False(t, ok)
+
+		require.Equal(t, int32(1), recorded.Load())
+
+		restarted := newScheme(t, confirming(t, 0, nil), store, record)
+		configure(restarted)
+		var restartedSubmits atomic.Int32
+		restarted.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) {
+				ch.Settlement = generated.SettlementWatermarks{PayoutWatermark: 1700, Settled: 1700}
+			}), nil
+		}
+		restarted.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			restartedSubmits.Add(1)
+			return durableResult{}, errors.New("should not submit")
+		}
+		replay, err := restarted.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.False(t, replay.Success, "a completed distribution is not answered again")
+		require.Equal(t, batchsettlement.ErrCumulativeAmountMismatch, replay.ErrorReason)
+		require.Empty(t, replay.Transaction)
+		require.Equal(t, map[string]any{batchsettlement.ExtraChannelStates: paidOut}, replay.Extra)
+		require.Zero(t, restartedSubmits.Load())
+		require.Equal(t, int32(1), recorded.Load(), "a retry must not deliver the payout to the hook again")
+
+		hookless := newScheme(t, confirming(t, 0, nil), x402.NewInMemoryPendingSettlementStore(), nil)
+		configure(hookless)
+		hookless.hooks.readChannel = restarted.hooks.readChannel
+		hookless.hooks.submitRedemption = restarted.hooks.submitRedemption
+		answered, err := hookless.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.False(t, answered.Success)
+		require.Equal(t, batchsettlement.ErrCumulativeAmountMismatch, answered.ErrorReason)
+		require.Zero(t, restartedSubmits.Load())
+
+		restarted.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) {
+				ch.Settlement = generated.SettlementWatermarks{PayoutWatermark: 1700, Settled: 2200}
+			}), nil
+		}
+		restarted.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			restartedSubmits.Add(1)
+			return durableResult{OK: true, Signature: "second-transaction"}, nil
+		}
+		innerCaps := newScriptedSigner(t, 1)
+		innerCaps.keys[0] = feePayer
+		restarted.raw = &capabilitySigner{
+			scriptedSigner: innerCaps,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				return payoutEvidence(t, "200", "1000"), nil
+			},
+		}
+		restarted.signer = &recordingSigner{PaymentChannelFacilitatorSigner: restarted.raw, scheme: restarted}
+		next, err := restarted.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.Equal(t, "second-transaction", next.Transaction)
+		require.Equal(t, int32(1), restartedSubmits.Load())
+	})
+
+	t.Run("waits for transaction metadata instead of estimating payout from a stale snapshot", func(t *testing.T) {
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		var confirmedCalls atomic.Int32
+		transport := &capabilitySigner{
+			scriptedSigner: inner,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				n := confirmedCalls.Add(1)
+				switch n {
+				case 1:
+					return nil, nil
+				case 2:
+					return nil, errors.New("RPC catching up")
+				default:
+					return payoutEvidence(t, "200", "9000"), nil
+				}
+			},
+		}
+		scheme := newScheme(t, transport, nil, nil)
+		configure(scheme)
+		scheme.hooks.fetchChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) {
+				ch.Settlement = generated.SettlementWatermarks{PayoutWatermark: 200, Settled: 1000}
+			}), nil
+		}
+		scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			return durableResult{OK: true, Signature: tx}, nil
+		}
+		scheme.hooks.waitForChannelRead = func(int) error { return nil }
+		payload := batchsettlement.BatchSettlePayload{
+			Type:     batchsettlement.PayloadTypeSettle,
+			Channels: []batchsettlement.BatchSettleChannel{{ChannelID: channelID, ChannelConfig: channelConfig}},
+		}
+		result, err := scheme.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.Equal(t, "8800", result.Amount)
+		require.Equal(t, int32(3), confirmedCalls.Load())
+	})
+
+	t.Run("retains the distribution when recording its payout fails", func(t *testing.T) {
+		store := x402.NewInMemoryPendingSettlementStore()
+		key := "batch:distribute:" + network + ":" + channelID
+		require.NoError(t, store.Set(context.Background(), key, tx))
+		var recordCalls atomic.Int32
+		record := func(context.Context, *x402.SettleResponse, types.PaymentRequirements) error {
+			if recordCalls.Add(1) == 1 {
+				return errors.New("ledger unavailable")
+			}
+			return nil
+		}
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		signer := &capabilitySigner{
+			scriptedSigner: inner,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				return payoutEvidence(t, "200", "1000"), nil
+			},
+		}
+		scheme := newScheme(t, signer, store, record)
+		configure(scheme)
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(nil), nil
+		}
+		payload := batchsettlement.BatchSettlePayload{
+			Type:     batchsettlement.PayloadTypeSettle,
+			Channels: []batchsettlement.BatchSettleChannel{{ChannelID: channelID, ChannelConfig: channelConfig}},
+		}
+		pending, err := scheme.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.False(t, pending.Success)
+		require.Equal(t, x402.ErrSettlementPending, pending.ErrorReason)
+		require.Equal(t, tx, pending.Transaction)
+		got, ok, err := store.Get(context.Background(), key)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, tx, got)
+
+		okResp, err := scheme.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.True(t, okResp.Success)
+		require.Equal(t, tx, okResp.Transaction)
+		require.Equal(t, "800", okResp.Amount)
+		_, ok, err = store.Get(context.Background(), key)
+		require.NoError(t, err)
+		require.False(t, ok)
+		_, ok, err = store.Get(context.Background(), resultKey(key))
+		require.NoError(t, err)
+		require.False(t, ok, "the payout record is deleted once the hook has run")
+		require.Equal(t, int32(2), recordCalls.Load())
+	})
+
+	t.Run("answers settlement_pending and keeps the payout record when deleting it fails", func(t *testing.T) {
+		key := "batch:distribute:" + network + ":" + channelID
+		store := &resultDeleteFailingStore{PendingSettlementStore: x402.NewInMemoryPendingSettlementStore()}
+		store.fail.Store(true)
+		var recordCalls atomic.Int32
+		record := func(context.Context, *x402.SettleResponse, types.PaymentRequirements) error {
+			recordCalls.Add(1)
+			return nil
+		}
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		signer := &capabilitySigner{
+			scriptedSigner: inner,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				return payoutEvidence(t, "200", "1000"), nil
+			},
+		}
+		scheme := newScheme(t, signer, store, record)
+		configure(scheme)
+		watermarks := generated.SettlementWatermarks{Settled: 1000}
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) { ch.Settlement = watermarks }), nil
+		}
+		scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			watermarks.PayoutWatermark = 1000
+			return durableResult{OK: true, Signature: tx}, nil
+		}
+		payload := batchsettlement.BatchSettlePayload{
+			Type:     batchsettlement.PayloadTypeSettle,
+			Channels: []batchsettlement.BatchSettleChannel{{ChannelID: channelID, ChannelConfig: channelConfig}},
+		}
+
+		pending, err := scheme.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.Equal(t, x402.ErrSettlementPending, pending.ErrorReason)
+		require.Equal(t, tx, pending.Transaction)
+		_, ok, err := store.Get(context.Background(), resultKey(key))
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		store.fail.Store(false)
+		finished, err := scheme.settleDistributions(context.Background(), payload, requirements)
+		require.NoError(t, err)
+		require.True(t, finished.Success)
+		require.Equal(t, tx, finished.Transaction)
+		require.Equal(t, int32(2), recordCalls.Load(), "the hook is idempotent per transaction and runs again")
+		_, ok, err = store.Get(context.Background(), resultKey(key))
+		require.NoError(t, err)
+		require.False(t, ok)
+	})
+
+	for _, withHook := range []bool{true, false} {
+		name := "keeps a confirmed sweep's signature when its payout is not visible yet and attributes it on retry"
+		if withHook {
+			name += " for the hook"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := x402.NewInMemoryPendingSettlementStore()
+			key := "batch:distribute:" + network + ":" + channelID
+			var visible atomic.Bool
+			inner := newScriptedSigner(t, 1)
+			inner.keys[0] = feePayer
+			signer := &capabilitySigner{
+				scriptedSigner: inner,
+				confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+					if !visible.Load() {
+						return nil, nil
+					}
+					return payoutEvidence(t, "200", "1000"), nil
+				},
+			}
+			var recorded atomic.Int32
+			var hook OnDistributionConfirmed
+			if withHook {
+				hook = func(context.Context, *x402.SettleResponse, types.PaymentRequirements) error {
+					recorded.Add(1)
+					return nil
+				}
+			}
+			scheme := newScheme(t, signer, store, hook)
+			configure(scheme)
+			var swept atomic.Bool
+			scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+				return channel(func(ch *generated.Channel) {
+					ch.Settlement = generated.SettlementWatermarks{Settled: 1000}
+					if swept.Load() {
+						ch.Settlement.PayoutWatermark = 1000
+					}
+				}), nil
+			}
+			scheme.hooks.waitForChannelRead = func(int) error { return nil }
+			var submits atomic.Int32
+			scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+				submits.Add(1)
+				swept.Store(true)
+				return durableResult{OK: true, Signature: tx}, nil
+			}
+			payload := batchsettlement.BatchSettlePayload{
+				Type:     batchsettlement.PayloadTypeSettle,
+				Channels: []batchsettlement.BatchSettleChannel{{ChannelID: channelID, ChannelConfig: channelConfig}},
+			}
+
+			pending, err := scheme.settleDistributions(context.Background(), payload, requirements)
+			require.NoError(t, err)
+			require.Equal(t, x402.ErrSettlementPending, pending.ErrorReason)
+			require.Equal(t, tx, pending.Transaction)
+			got, ok, err := store.Get(context.Background(), key)
+			require.NoError(t, err)
+			require.True(t, ok, "the sweep landed, so a retry must be able to find it")
+			require.Equal(t, tx, got)
+			require.Zero(t, recorded.Load())
+
+			visible.Store(true)
+			response, err := scheme.settleDistributions(context.Background(), payload, requirements)
+			require.NoError(t, err)
+			require.True(t, response.Success)
+			require.Equal(t, tx, response.Transaction)
+			require.Equal(t, "800", response.Amount)
+			require.Equal(t, int32(1), submits.Load(), "the retry must not sweep again")
+			if withHook {
+				require.Equal(t, int32(1), recorded.Load())
+			}
+			_, ok, err = store.Get(context.Background(), key)
+			require.NoError(t, err)
+			require.False(t, ok)
+		})
+	}
+
+	distributePayload := batchsettlement.BatchSettlePayload{
+		Type:     batchsettlement.PayloadTypeSettle,
+		Channels: []batchsettlement.BatchSettleChannel{{ChannelID: channelID, ChannelConfig: channelConfig}},
+	}
+	for _, payoutWatermark := range []uint64{1700, 2200} {
+		t.Run("delivers a payout whose hook failed before a claim moved settled to 2200 with payout watermark "+strconv.FormatUint(payoutWatermark, 10), func(t *testing.T) {
+			second := solana.Signature{8}.String()
+			inner := newScriptedSigner(t, 1)
+			inner.keys[0] = feePayer
+			signer := &capabilitySigner{
+				scriptedSigner: inner,
+				confirmed: func(_ context.Context, signature solana.Signature, _ string) (*svm.FacilitatorConfirmedTransaction, error) {
+					if signature.String() == second {
+						return payoutEvidence(t, "1700", "2200"), nil
+					}
+					return payoutEvidence(t, "200", "1700"), nil
+				},
+			}
+			var hookFails atomic.Bool
+			hookFails.Store(true)
+			var delivered []string
+			hook := func(_ context.Context, response *x402.SettleResponse, _ types.PaymentRequirements) error {
+				if hookFails.Load() {
+					return errors.New("ledger unavailable")
+				}
+				delivered = append(delivered, response.Transaction+"="+response.Amount)
+				return nil
+			}
+			scheme := newScheme(t, signer, x402.NewInMemoryPendingSettlementStore(), hook)
+			configure(scheme)
+			watermarks := generated.SettlementWatermarks{Settled: 1700}
+			scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+				return channel(func(ch *generated.Channel) { ch.Settlement = watermarks }), nil
+			}
+			var submits atomic.Int32
+			scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+				if submits.Add(1) == 1 {
+					watermarks.PayoutWatermark = 1700
+					return durableResult{OK: true, Signature: tx}, nil
+				}
+				watermarks.PayoutWatermark = 2200
+				return durableResult{OK: true, Signature: second}, nil
+			}
+
+			first, err := scheme.settleDistributions(context.Background(), distributePayload, requirements)
+			require.NoError(t, err)
+			require.Equal(t, x402.ErrSettlementPending, first.ErrorReason)
+			require.Equal(t, tx, first.Transaction)
+
+			watermarks = generated.SettlementWatermarks{Settled: 2200, PayoutWatermark: payoutWatermark}
+			blocked, err := scheme.settleDistributions(context.Background(), distributePayload, requirements)
+			require.NoError(t, err)
+			require.Equal(t, x402.ErrSettlementPending, blocked.ErrorReason)
+			require.Equal(t, tx, blocked.Transaction)
+			require.Equal(t, int32(1), submits.Load(), "no new pass while a landed payout is unaccounted")
+
+			hookFails.Store(false)
+			response, err := scheme.settleDistributions(context.Background(), distributePayload, requirements)
+			require.NoError(t, err)
+			require.True(t, response.Success)
+			if payoutWatermark == 2200 {
+				require.Equal(t, tx, response.Transaction)
+				require.Equal(t, int32(1), submits.Load())
+				require.Equal(t, []string{tx + "=1500"}, delivered)
+				return
+			}
+			require.Equal(t, second, response.Transaction)
+			require.Equal(t, "500", response.Amount)
+			require.Equal(t, int32(2), submits.Load())
+			require.Equal(t, []string{tx + "=1500", second + "=500"}, delivered)
+		})
+	}
+
+	t.Run("attributes a timed-out sweep that landed before a claim moved the settled watermark", func(t *testing.T) {
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		signer := &capabilitySigner{
+			scriptedSigner: inner,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				return payoutEvidence(t, "200", "1700"), nil
+			},
+		}
+		var delivered []string
+		hook := func(_ context.Context, response *x402.SettleResponse, _ types.PaymentRequirements) error {
+			delivered = append(delivered, response.Transaction+"="+response.Amount)
+			return nil
+		}
+		scheme := newScheme(t, signer, x402.NewInMemoryPendingSettlementStore(), hook)
+		configure(scheme)
+		watermarks := generated.SettlementWatermarks{Settled: 1700}
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) { ch.Settlement = watermarks }), nil
+		}
+		var submits atomic.Int32
+		scheme.hooks.submitRedemption = func(ctx context.Context, _, net string, _ []solana.Instruction, key, payer string) (durableResult, error) {
+			submits.Add(1)
+			timeout := &paymentchannels.SettlementConfirmationTimeoutError{Signature: tx}
+			return durableResult{Response: scheme.recordPending(ctx, key, tx, payer, net, timeout)}, nil
+		}
+
+		first, err := scheme.settleDistributions(context.Background(), distributePayload, requirements)
+		require.NoError(t, err)
+		require.Equal(t, x402.ErrSettlementPending, first.ErrorReason)
+
+		watermarks = generated.SettlementWatermarks{Settled: 2200, PayoutWatermark: 1700}
+		response, err := scheme.settleDistributions(context.Background(), distributePayload, requirements)
+		require.NoError(t, err)
+		require.True(t, response.Success)
+		require.Equal(t, tx, response.Transaction)
+		require.Equal(t, "1500", response.Amount)
+		require.Equal(t, int32(1), submits.Load(), "the landed sweep is accounted before another pass")
+		require.Equal(t, []string{tx + "=1500"}, delivered)
+	})
+
+	for _, unattributed := range []bool{false, true} {
+		name := "replays a stored payout after its channel is reclaimed"
+		if unattributed {
+			name = "attributes a landed sweep after its channel is reclaimed"
+		}
+		t.Run(name, func(t *testing.T) {
+			var visible atomic.Bool
+			visible.Store(!unattributed)
+			inner := newScriptedSigner(t, 1)
+			inner.keys[0] = feePayer
+			signer := &capabilitySigner{
+				scriptedSigner: inner,
+				confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+					if !visible.Load() {
+						return nil, nil
+					}
+					return payoutEvidence(t, "200", "1700"), nil
+				},
+			}
+			var hookFails atomic.Bool
+			hookFails.Store(!unattributed)
+			var delivered []string
+			hook := func(_ context.Context, response *x402.SettleResponse, _ types.PaymentRequirements) error {
+				if hookFails.Load() {
+					return errors.New("ledger unavailable")
+				}
+				delivered = append(delivered, response.Transaction+"="+response.Amount)
+				return nil
+			}
+			scheme := newScheme(t, signer, x402.NewInMemoryPendingSettlementStore(), hook)
+			configure(scheme)
+			var reclaimed atomic.Bool
+			scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+				if reclaimed.Load() {
+					return nil, nil
+				}
+				return channel(func(ch *generated.Channel) { ch.Settlement = generated.SettlementWatermarks{Settled: 1700} }), nil
+			}
+			var waits atomic.Int32
+			scheme.hooks.waitForChannelRead = func(int) error {
+				waits.Add(1)
+				return nil
+			}
+			var submits atomic.Int32
+			scheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+				submits.Add(1)
+				return durableResult{OK: true, Signature: tx}, nil
+			}
+
+			first, err := scheme.settleDistributions(context.Background(), distributePayload, requirements)
+			require.NoError(t, err)
+			require.Equal(t, x402.ErrSettlementPending, first.ErrorReason)
+
+			reclaimed.Store(true)
+			visible.Store(true)
+			hookFails.Store(false)
+			waits.Store(0)
+			response, err := scheme.settleDistributions(context.Background(), distributePayload, requirements)
+			require.NoError(t, err)
+			require.True(t, response.Success)
+			require.Equal(t, tx, response.Transaction)
+			require.Equal(t, "1500", response.Amount)
+			require.Equal(t, int32(1), submits.Load())
+			require.Zero(t, waits.Load(), "an absent channel is not polled when a recovery record exists")
+			require.Equal(t, []string{tx + "=1500"}, delivered)
+		})
+	}
+
+	for _, withHook := range []bool{true, false} {
+		name := "a distribute pass, its identical retry and a later pass cost the same storage operations without the hook"
+		if withHook {
+			name = "a distribute pass, its identical retry and a later pass cost the same storage operations with the hook"
+		}
+		t.Run(name, func(t *testing.T) {
+			counts := &opCounts{}
+			inner := newScriptedSigner(t, 1)
+			inner.keys[0] = feePayer
+			signer := &capabilitySigner{
+				scriptedSigner: inner,
+				confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+					return payoutEvidence(t, "200", "1700"), nil
+				},
+			}
+			cfg := &Config{
+				PendingSettlementStore:   &countingPendingStore{PendingSettlementStore: x402.NewInMemoryPendingSettlementStore(), counts: counts},
+				DuplicateSettlementStore: &countingDuplicateStore{DuplicateSettlementStore: svm.NewInMemoryDuplicateSettlementStore(), counts: counts},
+			}
+			if withHook {
+				cfg.OnDistributionConfirmed = func(context.Context, *x402.SettleResponse, types.PaymentRequirements) error { return nil }
+			}
+			scheme := NewBatchSvmScheme(context.Background(), signer, cfg)
+			configure(scheme)
+			watermarks := generated.SettlementWatermarks{Settled: 1700}
+			scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+				return channel(func(ch *generated.Channel) { ch.Settlement = watermarks }), nil
+			}
+			run := func() int {
+				counts.mu.Lock()
+				counts.gets, counts.sets, counts.deletes, counts.reserves, counts.releases = 0, 0, 0, 0, 0
+				counts.mu.Unlock()
+				response, err := scheme.settleDistributions(context.Background(), distributePayload, requirements)
+				require.NoError(t, err)
+				if response.Success {
+					watermarks.PayoutWatermark = watermarks.Settled
+				}
+				return counts.total()
+			}
+			pass, retry := 2, 1
+			if withHook {
+				pass, retry = 5, 2
+			}
+			require.Equal(t, pass, run(), "first pass")
+			require.Equal(t, retry, run(), "identical retry")
+			watermarks.Settled = 2200
+			require.Equal(t, pass, run(), "later pass after a new claim")
+			require.Len(t, inner.sentTransactions(), 2)
+		})
+	}
+
+	t.Run("recovers request_close after stale reads and rejects a replay after cleanup", func(t *testing.T) {
+		payload := batchsettlement.BatchRefundPayload{
+			Type:          batchsettlement.PayloadTypeRefund,
+			ChannelConfig: channelConfig,
+			Transaction:   "signed-close",
+			Voucher: &batchsettlement.BatchVoucher{
+				ChannelID: channelID, ExpiresAt: 0, MaxClaimableAmount: "1000", Signature: "signature",
+			},
+		}
+		key := refundKey
+		store := x402.NewInMemoryPendingSettlementStore()
+		require.NoError(t, store.Set(context.Background(), key, tx))
+		recovering := newScheme(t, confirming(t, 0, nil), store, nil)
+		configure(recovering)
+		stubPrepareRefund(recovering)
+		var recoveryReads atomic.Int32
+		recovering.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			if recoveryReads.Add(1) == 1 {
+				return channel(nil), nil
+			}
+			return channel(func(ch *generated.Channel) {
+				ch.ClosureStartedAt = 20
+				ch.Status = uint8(generated.ChannelStatus_Closing)
+			}), nil
+		}
+		recovering.hooks.waitForChannelRead = func(int) error { return nil }
+		response, err := recovering.settleRefund(context.Background(), payload, requirements, nil)
+		require.NoError(t, err)
+		require.True(t, response.Success)
+		require.Equal(t, tx, response.Transaction)
+		extra := asMap(t, response.Extra)
+		state := asMap(t, extra["channelState"])
+		require.EqualValues(t, 20, state["withdrawRequestedAt"])
+		require.Equal(t, int32(2), recoveryReads.Load())
+
+		_, ok, err := store.Get(context.Background(), key)
+		require.NoError(t, err)
+		require.False(t, ok)
+
+		signer := confirming(t, 0, nil)
+		replayed := newScheme(t, signer, store, nil)
+		configure(replayed)
+		stubPrepareRefund(replayed)
+		replayed.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) {
+				ch.ClosureStartedAt = 20
+				ch.Status = uint8(generated.ChannelStatus_Closing)
+			}), nil
+		}
+		_, err = replayed.settleRefund(context.Background(), payload, requirements, nil)
+		require.ErrorContains(t, err, batchsettlement.ErrCloseState)
+		require.Empty(t, signer.sentTransactions())
+	})
+
+	t.Run("retains exact transaction identity when recovered postconditions are still stale", func(t *testing.T) {
+		claim := claimPayload(t, 1000)
+		distribute := batchsettlement.BatchSettlePayload{
+			Type:     batchsettlement.PayloadTypeSettle,
+			Channels: []batchsettlement.BatchSettleChannel{{ChannelID: channelID, ChannelConfig: channelConfig}},
+		}
+		refund := batchsettlement.BatchRefundPayload{
+			Type:          batchsettlement.PayloadTypeRefund,
+			ChannelConfig: channelConfig,
+			Transaction:   "signed-close",
+			Voucher: &batchsettlement.BatchVoucher{
+				ChannelID: channelID, ExpiresAt: 0, MaxClaimableAmount: "1000", Signature: "signature",
+			},
+		}
+		store := x402.NewInMemoryPendingSettlementStore()
+		require.NoError(t, store.Set(context.Background(), "batch:claim:"+network+":"+channelID+":1000", tx))
+		require.NoError(t, store.Set(context.Background(), "batch:distribute:"+network+":"+channelID, tx))
+		require.NoError(t, store.Set(context.Background(), refundKey, tx))
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		transport := &capabilitySigner{
+			scriptedSigner: inner,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				return nil, nil
+			},
+		}
+		scheme := newScheme(t, transport, store, nil)
+		configure(scheme)
+		scheme.hooks.waitForChannelRead = func(int) error { return nil }
+		scheme.hooks.reconcileBroadcast = func(context.Context, string, string, string, string) (durableResult, error) {
+			return durableResult{OK: true, Signature: tx}, nil
+		}
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(nil), nil
+		}
+		stubPrepareRefund(scheme)
+
+		claimResp, err := scheme.settleClaims(context.Background(), claim, requirements)
+		require.NoError(t, err)
+		require.Equal(t, x402.ErrSettlementPending, claimResp.ErrorReason)
+		require.Equal(t, tx, claimResp.Transaction)
+
+		distResp, err := scheme.settleDistributions(context.Background(), distribute, requirements)
+		require.NoError(t, err)
+		require.Equal(t, x402.ErrSettlementPending, distResp.ErrorReason)
+		require.Equal(t, tx, distResp.Transaction)
+
+		refundResp, err := scheme.settleRefund(context.Background(), refund, requirements, nil)
+		require.NoError(t, err)
+		require.Equal(t, x402.ErrSettlementPending, refundResp.ErrorReason)
+		require.Equal(t, tx, refundResp.Transaction)
+	})
+
+	t.Run("propagates terminal reconciliation responses for every recovered operation", func(t *testing.T) {
+		claim := claimPayload(t, 1000)
+		distribute := batchsettlement.BatchSettlePayload{
+			Type:     batchsettlement.PayloadTypeSettle,
+			Channels: []batchsettlement.BatchSettleChannel{{ChannelID: channelID, ChannelConfig: channelConfig}},
+		}
+		refund := batchsettlement.BatchRefundPayload{
+			Type:          batchsettlement.PayloadTypeRefund,
+			ChannelConfig: channelConfig,
+			Transaction:   "signed-close",
+			Voucher: &batchsettlement.BatchVoucher{
+				ChannelID: channelID, ExpiresAt: 0, MaxClaimableAmount: "1000", Signature: "signature",
+			},
+		}
+		store := x402.NewInMemoryPendingSettlementStore()
+		require.NoError(t, store.Set(context.Background(), "batch:claim:"+network+":"+channelID+":1000", tx))
+		require.NoError(t, store.Set(context.Background(), "batch:distribute:"+network+":"+channelID, tx))
+		require.NoError(t, store.Set(context.Background(), refundKey, tx))
+		scheme := newScheme(t, confirming(t, 0, nil), store, nil)
+		configure(scheme)
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(nil), nil
+		}
+		failure := &x402.SettleResponse{
+			ErrorReason: "transaction_failed",
+			Network:     x402.Network(network),
+			Success:     false,
+			Transaction: tx,
+		}
+		scheme.hooks.reconcileBroadcast = func(context.Context, string, string, string, string) (durableResult, error) {
+			return durableResult{OK: false, Response: failure}, nil
+		}
+		stubPrepareRefund(scheme)
+
+		claimResp, err := scheme.settleClaims(context.Background(), claim, requirements)
+		require.NoError(t, err)
+		require.Equal(t, failure, claimResp)
+		distResp, err := scheme.settleDistributions(context.Background(), distribute, requirements)
+		require.NoError(t, err)
+		require.Equal(t, failure, distResp)
+		refundResp, err := scheme.settleRefund(context.Background(), refund, requirements, nil)
+		require.NoError(t, err)
+		require.Equal(t, failure, refundResp)
+	})
+
+	t.Run("a concurrent duplicate loses the reservation and answers duplicate_settlement without sending or reconciling", func(t *testing.T) {
+		claim := claimPayload(t, 1000)
+		signer := confirming(t, 5, nil)
+		scheme := newScheme(t, signer, nil, nil)
+		configure(scheme)
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(nil), nil
+		}
+		key := "batch:claim:" + network + ":" + channelID + ":1000"
+		holder, reserved, err := scheme.duplicateStore.Reserve(context.Background(), key, tx, ReservationTTL)
+		require.NoError(t, err)
+		require.True(t, reserved)
+		require.Empty(t, holder)
+
+		response, err := scheme.settleClaims(context.Background(), claim, requirements)
+		require.NoError(t, err)
+		require.False(t, response.Success)
+		require.Equal(t, ChannelBusy, response.ErrorReason)
+		require.Empty(t, response.Transaction)
+		require.Empty(t, signer.sentTransactions())
+		require.Empty(t, signer.confirmCalls())
+	})
+
+	t.Run("a distribute that loses the reservation answers duplicate_settlement", func(t *testing.T) {
+		scheme := newScheme(t, confirming(t, 0, nil), nil, nil)
+		configure(scheme)
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(func(ch *generated.Channel) { ch.Settlement = generated.SettlementWatermarks{Settled: 1000} }), nil
+		}
+		key := "batch:distribute:" + network + ":" + channelID + ":pass:" + channelID + ":1000"
+		_, reserved, err := scheme.duplicateStore.Reserve(context.Background(), key, tx, ReservationTTL)
+		require.NoError(t, err)
+		require.True(t, reserved)
+
+		response, err := scheme.settleDistributions(context.Background(), distributePayload, requirements)
+		require.NoError(t, err)
+		require.False(t, response.Success)
+		require.Equal(t, ChannelBusy, response.ErrorReason)
+		require.Empty(t, response.Transaction)
+	})
+
+	t.Run("releases the reservation when the send fails definitively so a retry can broadcast", func(t *testing.T) {
+		signer := confirming(t, 0, nil)
+		scheme := newScheme(t, signer, nil, nil)
+		const key = "batch:claim:test"
+		_, err := scheme.broadcastUnchecked(context.Background(), key, network, "", func(onPrepared func(string, string) error) (string, error) {
+			require.NoError(t, onPrepared(tx, "wire"))
+			return "", errors.New("simulation rejected")
+		})
+		require.Error(t, err)
+		holder, reserved, err := scheme.duplicateStore.Reserve(context.Background(), key, "retry-signature", ReservationTTL)
+		require.NoError(t, err)
+		require.True(t, reserved)
+		require.Empty(t, holder)
+	})
+
+	t.Run("keeps the reservation when the confirmation outcome is unknown", func(t *testing.T) {
+		store := x402.NewInMemoryPendingSettlementStore()
+		scheme := newScheme(t, confirming(t, 0, nil), store, nil)
+		const key = "batch:claim:test"
+		result, err := scheme.broadcastUnchecked(context.Background(), key, network, "", func(onPrepared func(string, string) error) (string, error) {
+			require.NoError(t, onPrepared(tx, "wire"))
+			return "", &paymentchannels.SettlementConfirmationTimeoutError{Signature: tx}
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result.Response)
+		require.Equal(t, x402.ErrSettlementPending, result.Response.ErrorReason)
+		holder, reserved, err := scheme.duplicateStore.Reserve(context.Background(), key, "other", ReservationTTL)
+		require.NoError(t, err)
+		require.False(t, reserved)
+		require.Equal(t, tx, holder, "the reservation holds the record without the transaction")
+		got, ok, err := store.Get(context.Background(), key)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, encodeBroadcastRecord(tx, "", "wire"), got)
+	})
+
+	t.Run("fails terminally with the signature when the pending record cannot be stored and bounds postcondition polling", func(t *testing.T) {
+		store := &failingPendingStore{
+			getErr:    nil,
+			setErr:    errors.New("write unavailable"),
+			deleteErr: errors.New("delete unavailable"),
+		}
+		scheme := newScheme(t, confirming(t, 0, nil), store, nil)
+		configure(scheme)
+		result, err := scheme.broadcastUnchecked(context.Background(), "key", network, payer.PublicKey().String(), func(onPrepared func(string, string) error) (string, error) {
+			require.NoError(t, onPrepared(tx, "wire"))
+			return "", &paymentchannels.SettlementConfirmationTimeoutError{Signature: tx}
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result.Response)
+		require.Equal(t, "transaction_failed", result.Response.ErrorReason)
+		require.Equal(t, tx, result.Response.Transaction)
+		scheme.forgetPending(context.Background(), "key", tx)
+
+		var waits atomic.Int32
+		scheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			return channel(nil), nil
+		}
+		scheme.hooks.waitForChannelRead = func(int) error {
+			waits.Add(1)
+			return nil
+		}
+		_, matched, err := scheme.fetchChannelUntil(context.Background(), network, channelID, func(*generated.Channel) bool { return false })
+		require.NoError(t, err)
+		require.False(t, matched)
+		_, matched, err = scheme.fetchChannelsUntil(context.Background(), network, []string{channelID}, func([]*generated.Channel) bool { return false })
+		require.NoError(t, err)
+		require.False(t, matched)
+		require.Equal(t, int32(8), waits.Load())
+	})
+
+	t.Run("records pending and recovers an open deposit whose postcondition failed", func(t *testing.T) {
+		salt := uint64(0)
+		binding := batchsettlement.EncodeReceiverBindingMemo(receiver)
+		openConfig := channelConfig
+		openConfig.OpenSlot = 123
+		openBuilt, err := paymentchannels.BuildOpenTransaction(paymentchannels.BuildOpenArgs{
+			Payer:            payer.PublicKey(),
+			Payee:            feePayer.PublicKey(),
+			Mint:             solana.MustPublicKeyFromBase58(mint),
+			AuthorizedSigner: payer.PublicKey(),
+			FeePayer:         feePayer.PublicKey(),
+			TokenProgram:     solana.MustPublicKeyFromBase58(svm.TokenProgramAddress),
+			Deposit:          10_000,
+			Blockhash:        solana.Hash(solana.MustPublicKeyFromBase58(svm.USDCMainnetAddress)),
+			OpenSlot:         uint64(openConfig.OpenSlot),
+			GracePeriod:      900,
+			Recipients:       []paymentchannels.Split{{Recipient: receiver, BPS: batchsettlement.FullSplitBPS}},
+			Salt:             &salt,
+			BindingMemo:      &binding,
+		})
+		require.NoError(t, err)
+		_, err = openBuilt.Transaction.PartialSign(func(key solana.PublicKey) *solana.PrivateKey {
+			if key.Equals(payer.PublicKey()) {
+				return &payer
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		openWire, err := svm.EncodeTransaction(openBuilt.Transaction)
+		require.NoError(t, err)
+		openChannelID := openBuilt.ChannelID.String()
+		openSig, err := paymentchannels.SignVoucher(context.Background(), ed25519Signer{payer}, openBuilt.ChannelID, 1_000, 0)
+		require.NoError(t, err)
+		openPayload := batchsettlement.BatchDepositPayload{
+			Type:          batchsettlement.PayloadTypeDeposit,
+			ChannelConfig: openConfig,
+			Deposit:       batchsettlement.BatchDeposit{Amount: "10000", Transaction: openWire},
+			Voucher: &batchsettlement.BatchVoucher{
+				ChannelID: openChannelID, ExpiresAt: 0, MaxClaimableAmount: "1000", Signature: openSig,
+			},
+		}
+
+		depositStore := x402.NewInMemoryPendingSettlementStore()
+		channelStore := paymentchannels.NewInMemoryPaymentChannelStorage()
+		depositSigner := newTokenOwnerSigner(feePayer)
+		depositSigner.payer = payer.PublicKey()
+		depositScheme := newScheme(t, depositSigner, depositStore, nil)
+		depositScheme.channelStorage = channelStore
+		var openConfirmed atomic.Bool
+		var postReadFails atomic.Bool
+		postReadFails.Store(true)
+		depositScheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			if !openConfirmed.Load() {
+				return nil, nil
+			}
+			if postReadFails.Load() {
+				return nil, context.DeadlineExceeded
+			}
+			return channel(func(ch *generated.Channel) { ch.OpenSlot = uint64(openConfig.OpenSlot) }), nil
+		}
+		depositScheme.hooks.waitForChannelRead = func(int) error {
+			openConfirmed.Store(true)
+			return context.DeadlineExceeded
+		}
+
+		depositResp, err := depositScheme.Settle(context.Background(), types.PaymentPayload{
+			X402Version: 2, Accepted: requirements, Payload: asMap(t, openPayload),
+		}, requirements, nil)
+		require.Nil(t, depositResp)
+		var settleErr *x402.SettleError
+		require.ErrorAs(t, err, &settleErr)
+		require.Equal(t, x402.ErrSettlementPending, settleErr.ErrorReason)
+		require.NotEmpty(t, settleErr.Transaction, "confirmed open signature must be returned")
+		openTxSig := settleErr.Transaction
+
+		recordedSig, ok, err := depositStore.Get(context.Background(), depositKey(network, openChannelID))
+		require.NoError(t, err)
+		require.True(t, ok, "confirmed open must record a pending entry when its postcondition fails")
+		require.Equal(t, openTxSig, recordedSig)
+		storedChannel, err := channelStore.Get(context.Background(), network, openChannelID)
+		require.NoError(t, err)
+		require.NotNil(t, storedChannel, "confirmed open must keep its channel row")
+		require.Len(t, depositSigner.sentTransactions(), 1)
+
+		var replayReads atomic.Int32
+		depositScheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			if postReadFails.Load() && replayReads.Add(1)%2 == 0 {
+				return nil, context.DeadlineExceeded
+			}
+			return channel(func(ch *generated.Channel) { ch.OpenSlot = uint64(openConfig.OpenSlot) }), nil
+		}
+		replayPending, err := depositScheme.Settle(context.Background(), types.PaymentPayload{
+			X402Version: 2, Accepted: requirements, Payload: asMap(t, openPayload),
+		}, requirements, nil)
+		require.Nil(t, replayPending)
+		require.ErrorAs(t, err, &settleErr)
+		require.Equal(t, x402.ErrSettlementPending, settleErr.ErrorReason)
+		require.Equal(t, openTxSig, settleErr.Transaction)
+
+		postReadFails.Store(false)
+		depositScheme.hooks.waitForChannelRead = func(int) error { return nil }
+		recoveredDeposit, err := depositScheme.Settle(context.Background(), types.PaymentPayload{
+			X402Version: 2, Accepted: requirements, Payload: asMap(t, openPayload),
+		}, requirements, nil)
+		require.NoError(t, err)
+		require.True(t, recoveredDeposit.Success)
+		require.Equal(t, openTxSig, recoveredDeposit.Transaction)
+		require.Len(t, depositSigner.sentTransactions(), 1, "replay must not broadcast again")
+		_, ok, err = depositStore.Get(context.Background(), depositKey(network, openChannelID))
+		require.NoError(t, err)
+		require.False(t, ok)
+	})
+
+	t.Run("records pending and recovers a claim whose postcondition failed", func(t *testing.T) {
+		claim := claimPayload(t, 1_000)
+		claimStore := x402.NewInMemoryPendingSettlementStore()
+		claimScheme := newScheme(t, confirming(t, 1, nil), claimStore, nil)
+		configure(claimScheme)
+		var claimSettled atomic.Uint64
+		var claimPostErr atomic.Bool
+		claimPostErr.Store(true)
+		claimScheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			s := claimSettled.Load()
+			if s > 0 && claimPostErr.Load() {
+				return nil, context.DeadlineExceeded
+			}
+			return channel(func(ch *generated.Channel) { ch.Settlement.Settled = s }), nil
+		}
+		claimScheme.hooks.waitForChannelRead = func(int) error { return context.DeadlineExceeded }
+		var claimSubmits atomic.Int32
+		claimScheme.hooks.submitRedemption = func(context.Context, string, string, []solana.Instruction, string, string) (durableResult, error) {
+			claimSubmits.Add(1)
+			claimSettled.Store(1_000)
+			return durableResult{OK: true, Signature: tx}, nil
+		}
+		claimResp, err := claimScheme.settleClaims(context.Background(), claim, requirements)
+		require.NoError(t, err)
+		require.Equal(t, x402.ErrSettlementPending, claimResp.ErrorReason)
+		require.Equal(t, tx, claimResp.Transaction)
+		gotClaim, ok, err := claimStore.Get(context.Background(), "batch:claim:"+network+":"+channelID+":1000")
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, tx, gotClaim)
+
+		claimPostErr.Store(false)
+		claimScheme.hooks.waitForChannelRead = func(int) error { return nil }
+		claimRecovered, err := claimScheme.settleClaims(context.Background(), claim, requirements)
+		require.NoError(t, err)
+		require.True(t, claimRecovered.Success)
+		require.Equal(t, tx, claimRecovered.Transaction)
+		require.Equal(t, int32(1), claimSubmits.Load())
+	})
+
+	t.Run("records pending and recovers a request_close refund whose postcondition failed", func(t *testing.T) {
+		refund := batchsettlement.BatchRefundPayload{
+			Type:          batchsettlement.PayloadTypeRefund,
+			ChannelConfig: channelConfig,
+			Transaction:   closeWire,
+			Voucher: &batchsettlement.BatchVoucher{
+				ChannelID: channelID, ExpiresAt: 0, MaxClaimableAmount: "1000", Signature: "signature",
+			},
+		}
+		refundStore := x402.NewInMemoryPendingSettlementStore()
+		refundSigner := confirming(t, 1, nil)
+		refundScheme := newScheme(t, refundSigner, refundStore, nil)
+		configure(refundScheme)
+		stubPrepareRefund(refundScheme)
+		var closeConfirmed atomic.Bool
+		var refundPostErr atomic.Bool
+		refundPostErr.Store(true)
+		refundScheme.hooks.readChannel = func(context.Context, string, string) (*generated.Channel, error) {
+			if !closeConfirmed.Load() {
+				return channel(nil), nil
+			}
+			if refundPostErr.Load() {
+				return nil, context.DeadlineExceeded
+			}
+			return channel(func(ch *generated.Channel) {
+				ch.Status = uint8(generated.ChannelStatus_Closing)
+				ch.ClosureStartedAt = 42
+			}), nil
+		}
+		refundScheme.hooks.waitForChannelRead = func(int) error {
+			closeConfirmed.Store(true)
+			return context.DeadlineExceeded
+		}
+		refundPending, err := refundScheme.settleRefund(context.Background(), refund, requirements, nil)
+		require.NoError(t, err)
+		require.Equal(t, x402.ErrSettlementPending, refundPending.ErrorReason)
+		require.Equal(t, refundPending.Transaction, refundSigner.sentTransactions()[0].Signatures[0].String())
+		gotRefund, ok, err := refundStore.Get(context.Background(), refundKey)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, refundPending.Transaction, gotRefund)
+
+		refundPostErr.Store(false)
+		refundScheme.hooks.waitForChannelRead = func(int) error { return nil }
+		refundRecovered, err := refundScheme.settleRefund(context.Background(), refund, requirements, nil)
+		require.NoError(t, err)
+		require.True(t, refundRecovered.Success)
+		require.Equal(t, refundPending.Transaction, refundRecovered.Transaction)
+		require.Len(t, refundSigner.sentTransactions(), 1)
+	})
+}
+
+func TestStoredDistributionExtraShadowsEmbeddedField(t *testing.T) {
+	raw := `{"success":true,"transaction":"sig","network":"solana:devnet","amount":"800","payer":"payer","errorReason":"","extensions":{"memo":"keep"},"extra":{"channels":["chan-a"]}}`
+	var stored storedDistribution
+	require.NoError(t, json.Unmarshal([]byte(raw), &stored))
+	require.Equal(t, []string{"chan-a"}, stored.Extra.Channels)
+	require.Nil(t, stored.SettleResponse.Extra)
+	require.Equal(t, "keep", stored.Extensions["memo"])
+	require.Equal(t, "payer", stored.Payer)
+	require.Equal(t, "800", stored.Amount)
+
+	response, err := decodeDistributionResult(raw)
+	require.NoError(t, err)
+	channels, ok := response.Extra["channels"].([]string)
+	require.True(t, ok)
+	require.Equal(t, []string{"chan-a"}, channels)
+	require.Equal(t, "keep", response.Extensions["memo"])
+	require.Equal(t, "payer", response.Payer)
+	require.Equal(t, "800", response.Amount)
+
+	reloaded, err := decodeDistributionResult(`{"success":false,"errorReason":"payout_attribution_ambiguous","transaction":"sig","network":"solana:devnet","extensions":{"memo":"keep"}}`)
+	require.NoError(t, err)
+	require.Nil(t, reloaded.Extra)
+	require.Equal(t, "payout_attribution_ambiguous", reloaded.ErrorReason)
+	require.Equal(t, "keep", reloaded.Extensions["memo"])
+}
+
+type slotAccountSigner struct {
+	*confirmingSigner
+	getAccount func(context.Context, solana.PublicKey, string, *rpc.GetAccountInfoOpts) (*rpc.GetAccountInfoResult, error)
+}
+
+func (s *slotAccountSigner) GetAccountInfo(ctx context.Context, account solana.PublicKey, network string, opts *rpc.GetAccountInfoOpts) (*rpc.GetAccountInfoResult, error) {
+	return s.getAccount(ctx, account, network, opts)
+}
+
+type resultDeleteFailingStore struct {
+	x402.PendingSettlementStore
+	fail atomic.Bool
+}
+
+func (s *resultDeleteFailingStore) Delete(ctx context.Context, key string) error {
+	if s.fail.Load() && strings.HasSuffix(key, ":result") {
+		return errors.New("delete unavailable")
+	}
+	return s.PendingSettlementStore.Delete(ctx, key)
+}
+
+type resultSetFailingStore struct {
+	x402.PendingSettlementStore
+	fail atomic.Bool
+}
+
+func (s *resultSetFailingStore) Set(ctx context.Context, key, value string) error {
+	if s.fail.Load() && strings.HasSuffix(key, ":result") {
+		return errors.New("write unavailable")
+	}
+	return s.PendingSettlementStore.Set(ctx, key, value)
+}
+
+type failingPendingStore struct {
+	getErr    error
+	setErr    error
+	deleteErr error
+}
+
+func (s *failingPendingStore) Get(context.Context, string) (string, bool, error) {
+	return "", false, s.getErr
+}
+
+func (s *failingPendingStore) Set(context.Context, string, string) error {
+	return s.setErr
+}
+
+func (s *failingPendingStore) Delete(context.Context, string) error {
+	return s.deleteErr
+}
+
+func TestAmbiguousPayoutAttribution(t *testing.T) {
+	network := string(svm.SolanaDevnetCAIP2)
+	payer := mustKey(t)
+	feePayer := mustKey(t)
+	payTo := payer.PublicKey().String()
+	channelID := svm.USDCMainnetAddress
+	mint := solana.MustPublicKeyFromBase58(svm.USDCDevnetAddress)
+	tokenProgram := solana.MustPublicKeyFromBase58(svm.TokenProgramAddress)
+	recipient, err := paymentchannels.FindATA(payer.PublicKey(), mint, tokenProgram)
+	require.NoError(t, err)
+	escrow, err := paymentchannels.FindATA(solana.MustPublicKeyFromBase58(channelID), mint, tokenProgram)
+	require.NoError(t, err)
+	token := func(index int, owner, amount string) svm.FacilitatorTokenBalance {
+		return svm.FacilitatorTokenBalance{AccountIndex: index, Mint: svm.USDCDevnetAddress, Owner: owner, UITokenAmount: svm.FacilitatorTokenAmount{Amount: amount}}
+	}
+	signature := solana.Signature{7}
+	const key = "batch:distribute:test"
+	requirements := types.PaymentRequirements{
+		Amount: "1000", Asset: svm.USDCDevnetAddress, Network: network, PayTo: payTo, Scheme: batchsettlement.Scheme,
+	}
+	prepared := []PreparedDistribution{{
+		ChannelID: channelID,
+		ChannelConfig: batchsettlement.BatchChannelConfig{
+			Payer: payer.PublicKey().String(), Receiver: svm.USDCMainnetAddress, Token: svm.USDCDevnetAddress,
+		},
+		FeePayer: feePayer.PublicKey().String(),
+		Terms:    BatchTerms{FeePayer: feePayer.PublicKey().String(), TokenProgram: svm.TokenProgramAddress},
+	}}
+
+	newScheme := func(t *testing.T, store x402.PendingSettlementStore, hook func(context.Context, *x402.SettleResponse, types.PaymentRequirements) error, post []svm.FacilitatorTokenBalance) *BatchSvmScheme {
+		t.Helper()
+		inner := newScriptedSigner(t, 1)
+		inner.keys[0] = feePayer
+		signer := &capabilitySigner{
+			scriptedSigner: inner,
+			confirmed: func(context.Context, solana.Signature, string) (*svm.FacilitatorConfirmedTransaction, error) {
+				return &svm.FacilitatorConfirmedTransaction{
+					Slot:        100,
+					AccountKeys: []string{recipient.String(), escrow.String()},
+					Meta: &svm.FacilitatorConfirmedMeta{
+						PreTokenBalances:  []svm.FacilitatorTokenBalance{token(0, payTo, "100"), token(1, channelID, "9800")},
+						PostTokenBalances: post,
+					},
+				}, nil
+			},
+		}
+		return NewBatchSvmScheme(context.Background(), signer, &Config{
+			PendingSettlementStore:  store,
+			OnDistributionConfirmed: hook,
+		})
+	}
+
+	t.Run("answers with its own reason, keeps no payout record and forgets the pending record", func(t *testing.T) {
+		store := x402.NewInMemoryPendingSettlementStore()
+		require.NoError(t, store.Set(context.Background(), key, signature.String()))
+		var recorded int
+		scheme := newScheme(t, store, func(context.Context, *x402.SettleResponse, types.PaymentRequirements) error {
+			recorded++
+			return nil
+		}, []svm.FacilitatorTokenBalance{token(0, payTo, "9900")})
+
+		response, err := scheme.finishDistribution(context.Background(), key, signature.String(), true, prepared, nil, requirements)
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		require.Equal(t, batchsettlement.ErrPayoutAttributionAmbiguous, response.ErrorReason)
+		require.Equal(t, signature.String(), response.Transaction)
+		require.Zero(t, recorded)
+		_, ok, err := store.Get(context.Background(), key)
+		require.NoError(t, err)
+		require.False(t, ok)
+		_, ok, err = store.Get(context.Background(), resultKey(key))
+		require.NoError(t, err)
+		require.False(t, ok)
+	})
+
+	t.Run("writes no result record without OnDistributionConfirmed", func(t *testing.T) {
+		store := x402.NewInMemoryPendingSettlementStore()
+		require.NoError(t, store.Set(context.Background(), key, signature.String()))
+		scheme := newScheme(t, store, nil, []svm.FacilitatorTokenBalance{token(0, payTo, "9900")})
+
+		response, err := scheme.finishDistribution(context.Background(), key, signature.String(), true, prepared, nil, requirements)
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		require.Equal(t, batchsettlement.ErrPayoutAttributionAmbiguous, response.ErrorReason)
+		_, ok, err := store.Get(context.Background(), resultKey(key))
+		require.NoError(t, err)
+		require.False(t, ok)
+	})
+}
+
+func TestDistributionChannelStates(t *testing.T) {
+	const channelID = "chan-a"
+	prepared := []PreparedDistribution{{ChannelID: channelID}, {ChannelID: "chan-b"}}
+	channelAt := func(status generated.ChannelStatus, settled, payout uint64) *generated.Channel {
+		return &generated.Channel{
+			Status:           uint8(status),
+			Deposit:          10_000,
+			ClosureStartedAt: 7,
+			Settlement:       generated.SettlementWatermarks{Settled: settled, PayoutWatermark: payout},
+		}
+	}
+
+	t.Run("a confirmed sweep leaves payout at settled, and a sealed channel distributed", func(t *testing.T) {
+		states := distributedStates(prepared, []*generated.Channel{
+			channelAt(generated.ChannelStatus_Open, 3000, 1000),
+			channelAt(generated.ChannelStatus_Sealed, 2000, 0),
+		})
+		require.Equal(t, []batchsettlement.BatchRedemptionChannelState{
+			{ChannelID: channelID, Status: batchsettlement.ChannelStatusOpen, Balance: "10000", TotalClaimed: "3000", PayoutWatermark: "3000"},
+			{ChannelID: "chan-b", Status: batchsettlement.ChannelStatusDistributed, Balance: "10000", TotalClaimed: "2000", PayoutWatermark: "2000"},
+		}, states)
+	})
+
+	t.Run("a batch with an unread channel carries no states, so the server never adopts a partial batch", func(t *testing.T) {
+		require.Nil(t, distributedStates(prepared, []*generated.Channel{channelAt(generated.ChannelStatus_Open, 3000, 1000), nil}))
+		require.Len(t, observedStates(prepared, []*generated.Channel{channelAt(generated.ChannelStatus_Open, 3000, 1000), nil}), 1)
+	})
+
+	t.Run("a closing channel reports when its withdrawal was requested", func(t *testing.T) {
+		state := redemptionSnapshot(channelID, channelAt(generated.ChannelStatus_Closing, 3000, 1000))
+		require.Equal(t, batchsettlement.ChannelStatusClosing, state.Status)
+		require.Equal(t, int64(7), state.WithdrawRequestedAt)
+	})
+
+	t.Run("an unknown onchain status leaves the wire status empty", func(t *testing.T) {
+		require.Empty(t, redemptionSnapshot(channelID, channelAt(generated.ChannelStatus(99), 3000, 1000)).Status)
+	})
+
+	t.Run("a stored payout result keeps its channel states for a replay", func(t *testing.T) {
+		states := distributedStates(prepared, []*generated.Channel{
+			channelAt(generated.ChannelStatus_Open, 3000, 1000),
+			channelAt(generated.ChannelStatus_Open, 2000, 0),
+		})
+		stored := &x402.SettleResponse{
+			Success: true,
+			Extra:   map[string]any{"channels": []string{channelID, "chan-b"}, batchsettlement.ExtraChannelStates: states},
+		}
+		encoded, err := json.Marshal(stored)
+		require.NoError(t, err)
+		replayed, err := decodeDistributionResult(string(encoded))
+		require.NoError(t, err)
+		require.Equal(t, stored, replayed)
+	})
+}
+
+func TestConfirmationPolling(t *testing.T) {
+	t.Run("searches transaction history on the first lookup only", func(t *testing.T) {
+		var requests [][]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				ID     any    `json:"id"`
+				Method string `json:"method"`
+				Params []any  `json:"params"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			requests = append(requests, body.Params)
+			value := any(nil)
+			if len(requests) > 1 {
+				value = map[string]any{"slot": 7, "confirmationStatus": "confirmed", "err": nil}
+			}
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      body.ID,
+				"result":  map[string]any{"context": map[string]any{"slot": 1}, "value": []any{value}},
+			}))
+		}))
+		defer server.Close()
+		signature := solana.Signature{9}
+		err := paymentchannels.ConfirmSignature(context.Background(), rpc.New(server.URL), signature, 3*time.Second, true)
+		require.NoError(t, err)
+		require.Len(t, requests, 2)
+		require.Equal(t, []any{[]any{signature.String()}, map[string]any{"searchTransactionHistory": true}}, requests[0])
+		require.Equal(t, []any{[]any{signature.String()}}, requests[1])
+	})
+}

@@ -8,21 +8,20 @@ import {
   RoutesConfig,
   FacilitatorResponseError,
   getFacilitatorResponseError as getCoreFacilitatorResponseError,
+  prepareHttpServer,
   PaymentCancellationDispatcher,
   CompletedSettlement,
   SETTLEMENT_OVERRIDES_HEADER,
   withPrivateCacheControl,
 } from "@x402/core/server";
+import type { PreparedHttpServer } from "@x402/core/server";
 import type { PaymentPayload, PaymentRequirements } from "@x402/core/types";
 import { NextAdapter } from "./adapter";
 
 /**
  * Result of createHttpServer
  */
-export interface HttpServerInstance {
-  httpServer: x402HTTPResourceServer;
-  init: () => Promise<void>;
-}
+export type HttpServerInstance = PreparedHttpServer;
 
 export const getFacilitatorResponseError = getCoreFacilitatorResponseError;
 
@@ -54,56 +53,17 @@ export function createInternalErrorResponse(error: unknown): NextResponse {
 }
 
 /**
- * Prepares an existing x402HTTPResourceServer with initialization logic
+ * Decode percent-escapes in a request path.
  *
- * @param httpServer - Pre-configured x402HTTPResourceServer instance
- * @param paywall - Optional paywall provider for custom payment UI
- * @param syncFacilitatorOnStart - Whether to sync with the facilitator on start (defaults to true)
- * @returns The HTTP server instance with initialization function
+ * @param path - Request path
+ * @returns Decoded path, or the original if decoding fails
  */
-export function prepareHttpServer(
-  httpServer: x402HTTPResourceServer,
-  paywall?: PaywallProvider,
-  syncFacilitatorOnStart: boolean = true,
-): HttpServerInstance {
-  // Register custom paywall provider if provided
-  if (paywall) {
-    httpServer.registerPaywallProvider(paywall);
+function decodedRoutePath(path: string): string {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
   }
-
-  // Store initialization promise (not the result)
-  // httpServer.initialize() fetches facilitator support and validates routes
-  let initPromise: Promise<void> | null = syncFacilitatorOnStart ? httpServer.initialize() : null;
-  // Attach a no-op rejection handler so an early failure (e.g. a facilitator
-  // request timeout) cannot become an unhandled rejection before the first
-  // protected request awaits initPromise. The original promise is kept, so that
-  // request still observes the failure and triggers the retry path.
-  void initPromise?.catch(() => {});
-  let isInitialized = false;
-
-  return {
-    httpServer,
-    /**
-     * Ensures facilitator initialization succeeds once, while allowing retries after failures.
-     */
-    async init() {
-      if (!syncFacilitatorOnStart || isInitialized) {
-        return;
-      }
-
-      if (!initPromise) {
-        initPromise = httpServer.initialize();
-      }
-
-      try {
-        await initPromise;
-        isInitialized = true;
-      } catch (error) {
-        initPromise = null;
-        throw error;
-      }
-    },
-  };
 }
 
 /**
@@ -121,7 +81,6 @@ export function createHttpServer(
   paywall?: PaywallProvider,
   syncFacilitatorOnStart: boolean = true,
 ): HttpServerInstance {
-  // Create the x402 HTTP server instance with the resource server
   const httpServer = new x402HTTPResourceServer(server, routes);
 
   return prepareHttpServer(httpServer, paywall, syncFacilitatorOnStart);
@@ -136,9 +95,11 @@ export function createHttpServer(
 export function createRequestContext(request: NextRequest): HTTPRequestContext {
   // Create adapter and context
   const adapter = new NextAdapter(request);
+  const path = request.nextUrl.pathname;
   return {
     adapter,
-    path: request.nextUrl.pathname,
+    path,
+    decodedPath: decodedRoutePath(path),
     method: request.method,
     paymentHeader: adapter.getHeader("payment-signature") || adapter.getHeader("x-payment"),
   };
@@ -160,7 +121,17 @@ export function handlePaymentError(response: HTTPResponseInstructions): NextResp
       headers,
     });
   }
-  headers.set("Content-Type", "application/json");
+  const mediaType = headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
+  const isJson = !mediaType || mediaType === "application/json" || mediaType.endsWith("+json");
+  if (typeof response.body === "string" && !isJson) {
+    return new NextResponse(response.body, {
+      status: response.status,
+      headers,
+    });
+  }
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
   return new NextResponse(JSON.stringify(response.body || {}), {
     status: response.status,
     headers,
@@ -213,7 +184,7 @@ export async function handleSettlement(
 
   try {
     // Get response body for extensions
-    const responseBody = Buffer.from(await response.clone().arrayBuffer());
+    const responseBody = Buffer.from(await response.arrayBuffer());
 
     const responseHeaders: Record<string, string> = {};
     response.headers.forEach((value, key) => {
@@ -239,19 +210,24 @@ export async function handleSettlement(
       });
     }
 
-    // Settlement succeeded - add headers and return original response.
-    Object.entries(result.headers).forEach(([key, value]) => {
-      response.headers.set(key, value);
+    // Settlement succeeded - add headers and return the buffered response.
+    const settled = new NextResponse(response.body === null ? null : responseBody, {
+      status: response.status,
+      headers: response.headers,
     });
-    response.headers.set(
+    settled.headers.delete("transfer-encoding");
+    Object.entries(result.headers).forEach(([key, value]) => {
+      settled.headers.set(key, value);
+    });
+    settled.headers.set(
       "Cache-Control",
-      withPrivateCacheControl(response.headers.get("Cache-Control")),
+      withPrivateCacheControl(settled.headers.get("Cache-Control")),
     );
 
     // Strip internal settlement override header before sending to client.
-    response.headers.delete(SETTLEMENT_OVERRIDES_HEADER);
+    settled.headers.delete(SETTLEMENT_OVERRIDES_HEADER);
 
-    return response;
+    return settled;
   } catch (error) {
     if (error instanceof FacilitatorResponseError) {
       return createFacilitatorErrorResponse(error);

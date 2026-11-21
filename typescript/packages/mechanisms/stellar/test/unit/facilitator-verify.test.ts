@@ -3,6 +3,8 @@ import {
   Address,
   Networks as StellarNetworks,
   SorobanDataBuilder,
+  authorizeEntry,
+  buildAuthorizationEntryPreimage,
   rpc,
   Transaction,
   TransactionBuilder,
@@ -20,6 +22,7 @@ import {
   invalidVerifyResponse,
   validVerifyResponse,
 } from "../../src/exact/facilitator/scheme";
+import { getAddressCredentials } from "../../src/shared";
 import { createEd25519Signer } from "../../src/signer";
 import * as stellarUtils from "../../src/utils";
 import type { FacilitatorStellarSigner } from "../../src/signer";
@@ -48,7 +51,7 @@ function createMockContractEvent({
   to: string;
   amount: bigint;
   fnName?: string;
-  contractId?: xdr.Hash | null;
+  contractId?: xdr.ContractId | null;
 }): xdr.DiagnosticEvent {
   // symbol for the function name
   const transferSymbol = xdr.ScVal.scvSymbol(fnName);
@@ -80,7 +83,7 @@ function createMockContractEvent({
   });
   return createMockDiagnosticEvent(
     contractEventV0,
-    xdr.ContractEventType.contract(),
+    xdr.ContractEventType.contract,
     contractId ?? null,
   );
 }
@@ -91,7 +94,7 @@ function createMockContractEvent({
 function createMockSystemEvent(): xdr.DiagnosticEvent {
   return createMockDiagnosticEvent(
     new xdr.ContractEventV0({ topics: [], data: xdr.ScVal.scvVoid() }),
-    xdr.ContractEventType.system(),
+    xdr.ContractEventType.system,
   );
 }
 
@@ -107,19 +110,14 @@ function createMockSystemEvent(): xdr.DiagnosticEvent {
  */
 function createMockDiagnosticEvent(
   v0: xdr.ContractEventV0,
-  eventType: ReturnType<typeof xdr.ContractEventType.contract> = xdr.ContractEventType.contract(),
-  contractId: xdr.Hash | null = null,
+  eventType: xdr.ContractEventType = xdr.ContractEventType.contract,
+  contractId: xdr.ContractId | null = null,
 ): xdr.DiagnosticEvent {
-  const eventBodyXdr = xdr.ContractEventBody.toXDR(
-    xdr.ContractEventBody.fromXDR(
-      Buffer.concat([Buffer.from([0, 0, 0, 0]), xdr.ContractEventV0.toXDR(v0)]),
-    ),
-  );
   const contractEvent = new xdr.ContractEvent({
-    ext: xdr.ExtensionPoint.fromXDR(Buffer.from([0, 0, 0, 0])),
+    ext: xdr.ExtensionPoint.v0(),
     contractId,
     type: eventType,
-    body: xdr.ContractEventBody.fromXDR(eventBodyXdr),
+    body: xdr.ContractEventBody.v0(v0),
   });
   return new xdr.DiagnosticEvent({
     inSuccessfulContractCall: true,
@@ -144,6 +142,8 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
   } as unknown as rpc.Server;
 
   const CLIENT_PUBLIC = "GBBO4ZDDZTSM2IUKQYBAST3CFHNPFXECGEFTGWTA2WELR2BIWDK57UVE";
+  // Matches CLIENT_PUBLIC; needed to re-sign fixture auth entries over the CAP-71 V2 preimage
+  const CLIENT_SECRET = "SDV3OZOPGIO6GQAVI7T6ZJ7NSNFB26JX6QZYCI64TBC7BAZY6FQVAXXK";
   const FACILITATOR_PUBLIC = "GCQAXB2D77Y4C66CTGVH25H2RMUKMQJGOWUPK7UXGG5MAQBONUEKFQ4P";
   const TRANSACTION_RECIPIENT = "GCHEI4PQEFJOA27MNZRPQNLGURS6KASW76X5UZCUZIXCOJLKXYCXOR2W";
   const ASSET = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
@@ -217,10 +217,11 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
     stellarPayload = validPayload.payload as { transaction: string };
     const txEnvelope = xdr.TransactionEnvelope.fromXDR(stellarPayload.transaction, "base64");
     baseTransaction = new Transaction(stellarPayload.transaction, networkPassphrase);
-    baseSorobanData = txEnvelope.v1()?.tx()?.ext()?.sorobanData() || undefined;
+    const txExt = txEnvelope.type === "envelopeTypeTx" ? txEnvelope.v1.tx.ext : undefined;
+    baseSorobanData = txExt?.type === "sorobanData" ? txExt.sorobanData : undefined;
     baseOperation = baseTransaction.operations[0] as Operation.InvokeHostFunction;
     baseFunc = baseOperation.func;
-    baseInvokeContractArgs = baseFunc.invokeContract();
+    baseInvokeContractArgs = (baseFunc as xdr.HostFunctionInvokeContract).invokeContract;
   });
 
   /**
@@ -259,7 +260,8 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
       maxTransactionFeeStroops: 1_000_000,
     });
 
-    const expectedAssetHash = new Address(ASSET).toScAddress().contractId();
+    const expectedAssetHash = (new Address(ASSET).toScAddress() as xdr.ScAddressContract)
+      .contractId;
     const defaultTransferEvent = createMockContractEvent({
       from: CLIENT_PUBLIC,
       to: TRANSACTION_RECIPIENT,
@@ -321,6 +323,26 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
           "invalid_exact_stellar_payload_fee_exceeds_maximum",
           CLIENT_PUBLIC,
           "simulation-derived fee 200 stroops exceeds ceiling 150 stroops",
+        ),
+      );
+    });
+
+    it("should count the configured inclusion fee against the maximum", async () => {
+      const highInclusionFacilitator = new ExactStellarScheme(facilitatorSigners, {
+        areFeesSponsored: true,
+        maxTransactionFeeStroops: 1_000,
+        inclusionFeeStroops: 950,
+      });
+
+      vi.mocked(stellarUtils.getRpcClient).mockReturnValue(mockServer as rpc.Server);
+      vi.mocked(stellarUtils.getNetworkPassphrase).mockReturnValue(StellarNetworks.TESTNET);
+
+      const result = await highInclusionFacilitator.verify(validPayload, validRequirements);
+      expect(result).toEqual(
+        invalidVerifyResponse(
+          "invalid_exact_stellar_payload_fee_exceeds_maximum",
+          CLIENT_PUBLIC,
+          "simulation-derived fee 1050 stroops exceeds ceiling 1000 stroops",
         ),
       );
     });
@@ -402,9 +424,9 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
 
     it("should reject wrong contract function name", async () => {
       const wrongFuncArgs = new xdr.InvokeContractArgs({
-        contractAddress: baseInvokeContractArgs.contractAddress(),
+        contractAddress: baseInvokeContractArgs.contractAddress,
         functionName: "mint", // ❌ function name MUST be "transfer"
-        args: baseInvokeContractArgs.args(),
+        args: baseInvokeContractArgs.args,
       });
       const modifiedFunc = xdr.HostFunction.hostFunctionTypeInvokeContract(wrongFuncArgs);
       const modifiedOperation = Operation.invokeHostFunction({
@@ -448,7 +470,7 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
           throw new Error("Missing sorobanData or auth in test transaction");
         }
 
-        const originalArgs = baseInvokeContractArgs.args();
+        const originalArgs = baseInvokeContractArgs.args;
         const facilitatorKeypair = Keypair.fromPublicKey(facilitatorAddress);
         const facilitatorScAddress = xdr.ScVal.scvAddress(
           xdr.ScAddress.scAddressTypeAccount(
@@ -457,8 +479,8 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
         );
 
         const modifiedInvokeContractArgs = new xdr.InvokeContractArgs({
-          contractAddress: baseInvokeContractArgs.contractAddress(),
-          functionName: baseInvokeContractArgs.functionName(),
+          contractAddress: baseInvokeContractArgs.contractAddress,
+          functionName: baseInvokeContractArgs.functionName,
           args: [
             facilitatorScAddress, // ❌ facilitator CANNOT be the payer
             originalArgs[1],
@@ -475,6 +497,55 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
         const modifiedStellarPayload = buildStellarPayloadFromOp(modifiedOperation);
 
         const result = await facilitator.verify(modifiedStellarPayload, validRequirements);
+        expect(result.isValid).toBe(false);
+        expect(result.invalidReason).toBe("invalid_exact_stellar_payload_facilitator_is_payer");
+      });
+
+      it("should reject when a configured feeBumpSigner is the payer (from address)", async () => {
+        const feeBumpSigner = createEd25519Signer(
+          "SCKTFQJ2ASXITWPDKJ2KMQB7WOBNFV23OOTT6ZVO6AXVNAA3IJ7TRZFP",
+          STELLAR_TESTNET_CAIP2,
+        );
+        const facilitatorWithFeeBump = new ExactStellarScheme(facilitatorSigners, {
+          areFeesSponsored: true,
+          maxTransactionFeeStroops: 1_000_000,
+          feeBumpSigner,
+        });
+
+        if (!baseSorobanData || !baseOperation.auth?.length) {
+          throw new Error("Missing sorobanData or auth in test transaction");
+        }
+
+        const originalArgs = baseInvokeContractArgs.args;
+        const feeBumpKeypair = Keypair.fromPublicKey(feeBumpSigner.address);
+        const feeBumpScAddress = xdr.ScVal.scvAddress(
+          xdr.ScAddress.scAddressTypeAccount(
+            xdr.PublicKey.publicKeyTypeEd25519(feeBumpKeypair.rawPublicKey()),
+          ),
+        );
+
+        const modifiedInvokeContractArgs = new xdr.InvokeContractArgs({
+          contractAddress: baseInvokeContractArgs.contractAddress,
+          functionName: baseInvokeContractArgs.functionName,
+          args: [
+            feeBumpScAddress, // ❌ feeBumpSigner is facilitator-controlled too and must not be the payer
+            originalArgs[1],
+            originalArgs[2],
+          ],
+        });
+        const modifiedFunc = xdr.HostFunction.hostFunctionTypeInvokeContract(
+          modifiedInvokeContractArgs,
+        );
+        const modifiedOperation = Operation.invokeHostFunction({
+          ...baseOperation,
+          func: modifiedFunc,
+        });
+        const modifiedStellarPayload = buildStellarPayloadFromOp(modifiedOperation);
+
+        const result = await facilitatorWithFeeBump.verify(
+          modifiedStellarPayload,
+          validRequirements,
+        );
         expect(result.isValid).toBe(false);
         expect(result.invalidReason).toBe("invalid_exact_stellar_payload_facilitator_is_payer");
       });
@@ -497,18 +568,18 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
         }
 
         const originalAuth = baseOperation.auth[0];
-        const originalCreds = originalAuth.credentials().address();
+        const originalCreds = getAddressCredentials(originalAuth.credentials)!;
 
         const unsignedCreds = new xdr.SorobanAddressCredentials({
-          address: originalCreds.address(),
-          nonce: originalCreds.nonce(),
-          signatureExpirationLedger: originalCreds.signatureExpirationLedger(),
+          address: originalCreds.address,
+          nonce: originalCreds.nonce,
+          signatureExpirationLedger: originalCreds.signatureExpirationLedger,
           signature: xdr.ScVal.scvVoid(), // ❌ payer signature is missing
         });
 
         const authWithoutSignature = new xdr.SorobanAuthorizationEntry({
           credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(unsignedCreds),
-          rootInvocation: originalAuth.rootInvocation(),
+          rootInvocation: originalAuth.rootInvocation,
         });
 
         const modifiedOperation = Operation.invokeHostFunction({
@@ -529,7 +600,7 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
         }
 
         const originalAuth = baseOperation.auth[0];
-        const originalCreds = originalAuth.credentials().address();
+        const originalCreds = getAddressCredentials(originalAuth.credentials)!;
 
         const otherKeypair = Keypair.random();
         const otherAddressScVal = xdr.ScAddress.scAddressTypeAccount(
@@ -538,14 +609,14 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
 
         const pendingCreds = new xdr.SorobanAddressCredentials({
           address: otherAddressScVal,
-          nonce: originalCreds.nonce(),
-          signatureExpirationLedger: originalCreds.signatureExpirationLedger(),
+          nonce: originalCreds.nonce,
+          signatureExpirationLedger: originalCreds.signatureExpirationLedger,
           signature: xdr.ScVal.scvVoid(),
         });
 
         const pendingAuth = new xdr.SorobanAuthorizationEntry({
           credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(pendingCreds),
-          rootInvocation: originalAuth.rootInvocation(),
+          rootInvocation: originalAuth.rootInvocation,
         });
 
         const modifiedOperation = Operation.invokeHostFunction({
@@ -568,19 +639,19 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
         }
 
         const originalAuth = baseOperation.auth[0];
-        const originalCreds = originalAuth.credentials().address();
+        const originalCreds = getAddressCredentials(originalAuth.credentials)!;
         const farFuture = (txSignatureExpiration + 10_000).toString();
 
         const farFutureCreds = new xdr.SorobanAddressCredentials({
-          address: originalCreds.address(),
-          nonce: originalCreds.nonce(),
+          address: originalCreds.address,
+          nonce: originalCreds.nonce,
           signatureExpirationLedger: Number(farFuture), // ❌ Signature expiration too far
-          signature: originalCreds.signature(),
+          signature: originalCreds.signature,
         });
 
         const authWithFarExpiration = new xdr.SorobanAuthorizationEntry({
           credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(farFutureCreds),
-          rootInvocation: originalAuth.rootInvocation(),
+          rootInvocation: originalAuth.rootInvocation,
         });
 
         const modifiedOperation = Operation.invokeHostFunction({
@@ -601,18 +672,126 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
             throw new Error("Missing sorobanData in test transaction");
           }
 
-          const sourceAccountAuth = xdr.SorobanAuthorizationEntry.fromXDR(
-            xdr.SorobanAuthorizationEntry.toXDR(
-              new xdr.SorobanAuthorizationEntry({
-                credentials: xdr.SorobanCredentials.sorobanCredentialsSourceAccount(), // ❌ not sorobanCredentialsAddress
-                rootInvocation: baseOperation.auth![0].rootInvocation(),
-              }),
-            ),
-          );
+          const sourceAccountAuth = new xdr.SorobanAuthorizationEntry({
+            credentials: xdr.SorobanCredentials.sorobanCredentialsSourceAccount(), // ❌ not sorobanCredentialsAddress
+            rootInvocation: baseOperation.auth![0].rootInvocation,
+          });
 
           const modifiedOperation = Operation.invokeHostFunction({
             ...baseOperation,
             auth: [sourceAccountAuth],
+          });
+          const modifiedStellarPayload = buildStellarPayloadFromOp(modifiedOperation);
+
+          const result = await facilitator.verify(modifiedStellarPayload, validRequirements);
+          expect(result.isValid).toBe(false);
+          expect(result.invalidReason).toBe(
+            "invalid_exact_stellar_payload_unsupported_credential_type",
+          );
+        });
+
+        it("should accept CAP-71 V2 address credentials signed over the V2 preimage", async () => {
+          if (!baseSorobanData || !baseOperation.auth || baseOperation.auth.length === 0) {
+            throw new Error("Missing sorobanData or auth in test transaction");
+          }
+
+          // Protocol 28 activates the V2 arm, so clients can submit V2-signed
+          // entries and the facilitator must accept them alongside legacy V1.
+          // The entry is re-signed over the address-bound CAP-71 preimage rather
+          // than relabelling the V1 fixture's signature, so the payload matches
+          // what an upgraded network actually accepts.
+          const originalAuth = baseOperation.auth[0];
+          const originalCredentials = getAddressCredentials(originalAuth.credentials)!;
+          const expirationLedger = originalCredentials.signatureExpirationLedger;
+
+          const unsignedV2Auth = new xdr.SorobanAuthorizationEntry({
+            credentials: xdr.SorobanCredentials.sorobanCredentialsAddressV2(
+              new xdr.SorobanAddressCredentials({
+                address: originalCredentials.address,
+                nonce: originalCredentials.nonce,
+                signatureExpirationLedger: 0, // replaced by authorizeEntry
+                signature: xdr.ScVal.scvVoid(),
+              }),
+            ),
+            rootInvocation: originalAuth.rootInvocation,
+          });
+          const v2Auth = await authorizeEntry(
+            unsignedV2Auth,
+            Keypair.fromSecret(CLIENT_SECRET),
+            expirationLedger,
+            networkPassphrase,
+          );
+
+          // The signature must commit to the CAP-71 address-bound preimage
+          const v2Preimage = buildAuthorizationEntryPreimage(
+            v2Auth,
+            expirationLedger,
+            networkPassphrase,
+          );
+          expect(v2Preimage.type).toBe("envelopeTypeSorobanAuthorizationWithAddress");
+
+          const modifiedOperation = Operation.invokeHostFunction({
+            ...baseOperation,
+            auth: [v2Auth],
+          });
+          const modifiedStellarPayload = buildStellarPayloadFromOp(modifiedOperation);
+
+          const result = await facilitator.verify(modifiedStellarPayload, validRequirements);
+          expect(result).toEqual(validVerifyResponse(CLIENT_PUBLIC));
+        });
+
+        it("should reject an unsigned V2 entry as a missing payer signature", async () => {
+          if (!baseSorobanData || !baseOperation.auth || baseOperation.auth.length === 0) {
+            throw new Error("Missing sorobanData or auth in test transaction");
+          }
+
+          const originalAuth = baseOperation.auth[0];
+          const originalCredentials = getAddressCredentials(originalAuth.credentials)!;
+
+          const unsignedV2Auth = new xdr.SorobanAuthorizationEntry({
+            credentials: xdr.SorobanCredentials.sorobanCredentialsAddressV2(
+              new xdr.SorobanAddressCredentials({
+                address: originalCredentials.address,
+                nonce: originalCredentials.nonce,
+                signatureExpirationLedger: originalCredentials.signatureExpirationLedger,
+                signature: xdr.ScVal.scvVoid(), // ❌ never signed
+              }),
+            ),
+            rootInvocation: originalAuth.rootInvocation,
+          });
+
+          const modifiedOperation = Operation.invokeHostFunction({
+            ...baseOperation,
+            auth: [unsignedV2Auth],
+          });
+          const modifiedStellarPayload = buildStellarPayloadFromOp(modifiedOperation);
+
+          const result = await facilitator.verify(modifiedStellarPayload, validRequirements);
+          expect(result.isValid).toBe(false);
+          expect(result.invalidReason).toBe(
+            "invalid_exact_stellar_payload_missing_payer_signature",
+          );
+        });
+
+        it("should reject delegated (addressWithDelegates) credentials", async () => {
+          if (!baseSorobanData || !baseOperation.auth || baseOperation.auth.length === 0) {
+            throw new Error("Missing sorobanData or auth in test transaction");
+          }
+
+          const originalAuth = baseOperation.auth[0];
+          const delegatedAuth = new xdr.SorobanAuthorizationEntry({
+            credentials: xdr.SorobanCredentials.sorobanCredentialsAddressWithDelegates(
+              new xdr.SorobanAddressCredentialsWithDelegates({
+                addressCredentials: getAddressCredentials(originalAuth.credentials)!,
+                delegates: [],
+              }),
+            ),
+            rootInvocation: originalAuth.rootInvocation,
+          });
+
+          const modifiedOperation = Operation.invokeHostFunction({
+            ...baseOperation,
+            auth: [delegatedAuth],
           });
           const modifiedStellarPayload = buildStellarPayloadFromOp(modifiedOperation);
 
@@ -631,20 +810,20 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
           }
 
           const originalAuth = baseOperation.auth[0];
-          const originalRootInvocation = originalAuth.rootInvocation();
+          const originalRootInvocation = originalAuth.rootInvocation;
 
           const subInvocation = new xdr.SorobanAuthorizedInvocation({
-            function: originalRootInvocation.function(),
+            function: originalRootInvocation.function,
             subInvocations: [],
           });
 
           const rootWithSubInvocations = new xdr.SorobanAuthorizedInvocation({
-            function: originalRootInvocation.function(),
+            function: originalRootInvocation.function,
             subInvocations: [subInvocation], // ❌ sub-invocations not allowed
           });
 
           const authWithSubInvocations = new xdr.SorobanAuthorizationEntry({
-            credentials: originalAuth.credentials(),
+            credentials: originalAuth.credentials,
             rootInvocation: rootWithSubInvocations,
           });
 
@@ -668,7 +847,7 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
 
           const facilitatorAddress = facilitatorSigner1.address;
           const originalAuth = baseOperation.auth[0];
-          const originalAddressCredentials = originalAuth.credentials().address();
+          const originalAddressCredentials = getAddressCredentials(originalAuth.credentials)!;
 
           const facilitatorKeypair = Keypair.fromPublicKey(facilitatorAddress);
           const facilitatorAddressScVal = xdr.ScAddress.scAddressTypeAccount(
@@ -677,14 +856,14 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
 
           const facilitatorCredentials = new xdr.SorobanAddressCredentials({
             address: facilitatorAddressScVal, // ❌ facilitator address in auth entry
-            nonce: originalAddressCredentials.nonce(),
-            signatureExpirationLedger: originalAddressCredentials.signatureExpirationLedger(),
-            signature: originalAddressCredentials.signature(),
+            nonce: originalAddressCredentials.nonce,
+            signatureExpirationLedger: originalAddressCredentials.signatureExpirationLedger,
+            signature: originalAddressCredentials.signature,
           });
 
           const authWithFacilitator = new xdr.SorobanAuthorizationEntry({
             credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(facilitatorCredentials),
-            rootInvocation: originalAuth.rootInvocation(),
+            rootInvocation: originalAuth.rootInvocation,
           });
 
           const modifiedOperation = Operation.invokeHostFunction({
@@ -769,7 +948,8 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
 
     // Event-based balance change validation
     describe("simulation event validation", () => {
-      const expectedAssetHash = () => new Address(ASSET).toScAddress().contractId();
+      const expectedAssetHash = () =>
+        (new Address(ASSET).toScAddress() as xdr.ScAddressContract).contractId;
 
       it("should reject when simulation shows multiple transfer events", async () => {
         const mockTransferEvent1 = createMockContractEvent({
@@ -905,7 +1085,7 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
           from: CLIENT_PUBLIC,
           to: TRANSACTION_RECIPIENT,
           amount: BigInt(10000),
-          contractId: new Address(wrongAsset).toScAddress().contractId(),
+          contractId: (new Address(wrongAsset).toScAddress() as xdr.ScAddressContract).contractId,
         });
 
         vi.mocked(mockServer.simulateTransaction).mockResolvedValueOnce({
@@ -997,6 +1177,26 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
       expect(result).toEqual(validVerifyResponse(CLIENT_PUBLIC));
       expect(stellarUtils.getRpcClient).toHaveBeenCalledWith(STELLAR_TESTNET_CAIP2, undefined);
       expect(mockServer.simulateTransaction).toHaveBeenCalled();
+    });
+
+    it("should pass rpcConfig to the ledger close time estimate", async () => {
+      const rpcConfig = {
+        url: "https://rpc.example.com",
+        horizonUrl: "https://horizon.example.com",
+      };
+      const configuredFacilitator = new ExactStellarScheme(facilitatorSigners, {
+        areFeesSponsored: true,
+        maxTransactionFeeStroops: 1_000_000,
+        rpcConfig,
+      });
+
+      const result = await configuredFacilitator.verify(validPayload, validRequirements);
+
+      expect(result.isValid).toBe(true);
+      expect(stellarUtils.getEstimatedLedgerCloseTimeSeconds).toHaveBeenCalledWith(
+        STELLAR_TESTNET_CAIP2,
+        rpcConfig,
+      );
     });
   });
 });

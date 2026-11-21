@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"regexp"
 	"strings"
 	"time"
 
@@ -196,6 +197,22 @@ func CreatePermit2Nonce() (string, error) {
 	return nonceInt.String(), nil
 }
 
+var uint256DecimalPattern = regexp.MustCompile(`^[0-9]{1,78}$`)
+
+// ParseUint256String returns the integer in a uint256 decimal string.
+// The string is 1 to 78 digits and the value is at most 2^256-1.
+// A sign, blank, prefix, separator, or decimal point is rejected.
+func ParseUint256String(value string) (*big.Int, bool) {
+	if !uint256DecimalPattern.MatchString(value) {
+		return nil, false
+	}
+	parsed, ok := new(big.Int).SetString(value, 10)
+	if !ok || parsed.BitLen() > 256 {
+		return nil, false
+	}
+	return parsed, true
+}
+
 // MaxUint256 returns the maximum value for uint256 (used for unlimited approval).
 func MaxUint256() *big.Int {
 	max := new(big.Int)
@@ -352,8 +369,22 @@ func BytesToHex(data []byte) string {
 // ValidateAssetIsContract checks whether the payment asset is a deployed contract.
 // Returns (ErrAssetNotDeployedContract, nil) for an EOA/empty address,
 // ("", nil) for a deployed contract, or ("", err) if eth_getCode itself fails.
-func ValidateAssetIsContract(ctx context.Context, signer FacilitatorEvmSigner, asset string) (string, error) {
-	code, err := signer.GetCode(ctx, NormalizeAddress(asset))
+//
+// network identifies the chain the signer is bound to. It must be accurate, since it scopes the
+// cache that serves positive results; an empty network disables caching for the call. Only
+// StartAssetContractCheck populates that cache, so calling this directly always hits the RPC.
+func ValidateAssetIsContract(
+	ctx context.Context,
+	signer FacilitatorEvmSigner,
+	network string,
+	asset string,
+) (string, error) {
+	normalizedAsset := NormalizeAddress(asset)
+	if globalAssetContractCache.isFresh(assetContractCacheKey{network: network, asset: normalizedAsset}, time.Now()) {
+		return "", nil
+	}
+
+	code, err := signer.GetCode(ctx, normalizedAsset)
 	if err != nil {
 		return "", fmt.Errorf("failed to check whether asset is a contract: %w", err)
 	}

@@ -24,17 +24,19 @@ import {
   x402UptoPermit2ProxyAddress,
 } from "../../constants";
 import {
-  ErrAssetNotDeployedContract,
   ErrErc20ApprovalTxFailed,
   ErrPermit2AmountMismatch,
   ErrUptoSettlementExceedsAmount,
   ErrUptoFacilitatorMismatch,
+  ErrUptoInvalidPayload,
+  ErrUptoInvalidRequiredAmount,
   ErrUptoInvalidScheme,
   ErrUptoNetworkMismatch,
   ErrUptoTransactionFailed,
 } from "./errors";
 import { FacilitatorEvmSigner } from "../../signer";
 import { UptoPermit2Payload } from "../../types";
+import { startAssetContractCheck } from "../../assetCache";
 import { finalHashFromTwoRequestSend, getEvmChainId, isValidTxHash } from "../../utils";
 import { validateErc20ApprovalForPayment } from "../../shared/erc20approval";
 import { verifyTypedDataSignature } from "../../shared/verifySignature";
@@ -112,10 +114,8 @@ export async function verifyUptoPermit2(
   const chainId = getEvmChainId(requirements.network);
   const tokenAddress = getAddress(requirements.asset);
 
-  const assetBytecode = await signer.getCode({ address: tokenAddress });
-  if (!assetBytecode || assetBytecode === "0x") {
-    return { isValid: false, invalidReason: ErrAssetNotDeployedContract, payer };
-  }
+  // Run the asset-contract check concurrently with the signature check below.
+  const assetCheck = startAssetContractCheck(signer, requirements.network, requirements.asset);
 
   if (
     getAddress(permit2Payload.permit2Authorization.spender) !==
@@ -138,7 +138,6 @@ export async function verifyUptoPermit2(
     };
   }
 
-  // Verify the facilitator address in the witness matches our own address
   const facilitatorAddresses = signer.getAddresses();
   const witnessFacilitator = getAddress(permit2Payload.permit2Authorization.witness.facilitator);
   const isFacilitatorMatch = facilitatorAddresses.some(
@@ -148,6 +147,18 @@ export async function verifyUptoPermit2(
     return {
       isValid: false,
       invalidReason: ErrUptoFacilitatorMismatch,
+      payer,
+    };
+  }
+
+  let requiredAmount: bigint;
+  try {
+    requiredAmount = BigInt(requirements.amount);
+  } catch {
+    return {
+      isValid: false,
+      invalidReason: ErrUptoInvalidRequiredAmount,
+      invalidMessage: "invalid required amount format",
       payer,
     };
   }
@@ -169,9 +180,7 @@ export async function verifyUptoPermit2(
     };
   }
 
-  if (
-    BigInt(permit2Payload.permit2Authorization.permitted.amount) !== BigInt(requirements.amount)
-  ) {
+  if (BigInt(permit2Payload.permit2Authorization.permitted.amount) !== requiredAmount) {
     return {
       isValid: false,
       invalidReason: ErrPermit2AmountMismatch,
@@ -221,6 +230,12 @@ export async function verifyUptoPermit2(
     ...permit2TypedData,
     signature: permit2Payload.signature,
   });
+
+  const assetReason = await assetCheck.await();
+  if (assetReason) {
+    return { isValid: false, invalidReason: assetReason, payer };
+  }
+
   if (!signatureValid) {
     return {
       isValid: false,
@@ -229,7 +244,6 @@ export async function verifyUptoPermit2(
     };
   }
 
-  // If simulation is disabled, return early
   if (options?.simulate === false) {
     return { isValid: true, invalidReason: undefined, payer };
   }
@@ -240,7 +254,7 @@ export async function verifyUptoPermit2(
   // At settle time, requirements.amount = actual settlement amount (≤ max).
   const uptoSettleArgs = buildUptoPermit2SettleArgs(
     permit2Payload,
-    BigInt(requirements.amount),
+    requiredAmount,
     facilitatorAddress,
   );
 
@@ -367,7 +381,19 @@ export async function settleUptoPermit2(
 ): Promise<SettleResponse> {
   const payer = permit2Payload.permit2Authorization.from;
   const signature = permit2Payload.signature;
-  const settlementAmount = BigInt(requirements.amount);
+  let settlementAmount: bigint;
+  try {
+    settlementAmount = BigInt(requirements.amount);
+  } catch {
+    return {
+      success: false,
+      network: payload.accepted.network,
+      transaction: "",
+      errorReason: ErrUptoInvalidPayload,
+      errorMessage: "invalid settlement amount",
+      payer,
+    };
+  }
 
   // Fast path: a prior settle attempt for this exact payload already
   // broadcast a transaction whose receipt wait failed (settlement_pending).
@@ -423,6 +449,7 @@ export async function settleUptoPermit2(
       network: payload.accepted.network,
       transaction: "",
       errorReason: valid.invalidReason ?? "invalid_scheme",
+      errorMessage: valid.invalidMessage,
       payer,
     };
   }
