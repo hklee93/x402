@@ -104,6 +104,34 @@ Do not turn a missing test into a pass. Each result must include commit SHA, com
 - **Gate 5 — Security:** independent review of XDR, auth, replay, fee sponsorship, event semantics, idempotency and privacy.
 - **Gate 6 — Release:** maintainer acceptance and immutable evidence bundle; Mainnet remains a separate authorization.
 
+
+## H. Extended commerce, QR/NFC, subscriptions and economic gateways
+
+| ID | Scenario | Expected result | Evidence |
+|---|---|---|---|
+| COM-001 | Quote is expired when payment requirements are constructed | Reject; require a new merchant quote and buyer approval | Quote lifecycle unit test |
+| COM-002 | Product valuation changes after buyer approval | Preserve the authorized amount; never silently reprice | State-binding integration test |
+| COM-003 | Quote merchant, order, recipient, asset or network differs from request | Reject | Parameterized adapter test |
+| EVT-001 | Duplicate commerce event ID is consumed twice | Idempotent no-op; no duplicate order transition or fulfilment | Event consumer test |
+| EVT-002 | Commerce event arrives before its causal predecessor | Hold for reconciliation; do not apply invalid transition | Out-of-order event test |
+| EVT-003 | Payment-confirmed event lacks verified settlement receipt/read-back | Reject or quarantine | Event verification test |
+| EVT-004 | Fulfilled event lacks required merchant fulfilment evidence | Keep fulfilment pending | Fulfilment policy test |
+| QRN-001 | QR/NFC request is expired, replayed or cross-network substituted | Reject | QR/NFC parser and replay test |
+| QRN-002 | QR/NFC payload contains a seed, private key or unnecessary personal data | Reject/redact and raise security signal | Payload inspection test |
+| QRN-003 | QR/NFC scan is treated as user payment approval | Reject; require explicit wallet confirmation | Client security test |
+| SUB-001 | New subscription period has no fresh valid authorization | Do not submit payment | Billing scheduler test |
+| SUB-002 | Same billing period retries after RPC timeout | Reconcile original transaction; never double-charge | Fault-injection/concurrency test |
+| SUB-003 | Subscription cancelled before next billing period | Do not create the next payment request | Subscription state test |
+| MET-001 | Metrics include pending, duplicate, self-transfer or circular volume | Exclude and disclose exclusions | Metrics fixture test |
+| MET-002 | Report omits measurement window, denominator or asset/venue scope | Reject as incomplete | Schema/business-rule test |
+| MET-003 | Allocation totals do not exactly conserve source amount | Reject report/projection | Integer property test |
+| GATE-001 | Required economic gateway is stale or unavailable | Aggregate decision cannot be PASS | Gateway contract test |
+| GATE-002 | Gateway returns HTTP 200 with FAIL/REVIEW_REQUIRED status | Preserve non-PASS state | Consumer policy test |
+| GATE-003 | Oracle/market quote attempts to alter buyer-approved x402 amount | Reject mutation | Amount immutability test |
+| REL-001 | Testnet checks pass but independent Mainnet approval is absent | Block Mainnet release | Release policy test |
+
+These are proposed test cases, not executed results. They remain `NOT_RUN` until an implementation and reproducible evidence exist.
+
 ## Current evidence status
 
 All test IDs in this matrix are `NOT_RUN` until a concrete implementation, command output and immutable CI evidence are attached. This document is a review plan, not a claim of passing conformance.
