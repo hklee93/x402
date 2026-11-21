@@ -10,11 +10,13 @@ This directory documents an optional mapping between the Pi Network `pinet` exac
 - Keep Pi network identity, asset identity, authorization, and settlement verification explicit.
 - Map useful PiRC concepts to x402 request, settlement, and evidence lifecycles without making PiRC a dependency of x402.
 - Separate payment authorization from valuation, provenance, oracle, governance, RWA, and economic-accounting systems.
+- Extend the integration boundary to commerce lifecycle, QR/NFC handoff, subscriptions, economic gateways and reproducible metrics.
 - Define testable negative cases and an evidence policy before claiming interoperability.
 
 ## Documents
 
 - [PiRC interoperability profile](./pirc-interoperability-profile.md) — bounded crosswalk and security invariants.
+- [Extended capability map](./extended-capability-map.md) — product valuation, commerce events, QR/NFC, subscriptions, four economic gateways, metrics and release evidence.
 - [Conformance matrix](./conformance-matrix.md) — test cases, layers, and evidence required for each claim.
 - [Test vectors](./test-vectors.json) — machine-readable scenario catalogue. These are scenario definitions, not executed test results or signed XDR fixtures.
 
