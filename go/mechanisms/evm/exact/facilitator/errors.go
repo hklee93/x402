@@ -11,7 +11,7 @@ const (
 	ErrMissingSignature            = "invalid_exact_evm_payload_missing_signature"
 	ErrFailedToGetNetworkConfig    = "invalid_exact_evm_failed_to_get_network_config"
 	ErrMissingEip712Domain         = "invalid_exact_evm_missing_eip712_domain"
-	ErrRecipientMismatch           = "invalid_exact_evm_recipient_mismatch"
+	ErrRecipientMismatch           = "invalid_exact_evm_payload_recipient_mismatch"
 	ErrInvalidAuthorizationValue   = "invalid_exact_evm_authorization_value"
 	ErrInvalidRequiredAmount       = "invalid_exact_evm_required_amount"
 	ErrAuthorizationValueMismatch  = "invalid_exact_evm_payload_authorization_value_mismatch"
@@ -22,6 +22,7 @@ const (
 	ErrInvalidSignatureFormat      = "invalid_exact_evm_signature_format"
 	ErrFailedToVerifySignature     = "invalid_exact_evm_failed_to_verify_signature"
 	ErrInvalidSignature            = "invalid_exact_evm_signature"
+	ErrInvalidSignatureS           = "invalid_exact_evm_non_canonical_signature"
 	ErrValidBeforeExpired          = "invalid_exact_evm_payload_authorization_valid_before"
 	ErrValidAfterInFuture          = "invalid_exact_evm_payload_authorization_valid_after"
 	ErrEip3009TokenNameMismatch    = "invalid_exact_evm_token_name_mismatch"
@@ -30,8 +31,10 @@ const (
 	ErrEip3009SimulationFailed     = "invalid_exact_evm_transaction_simulation_failed"
 
 	// EIP-3009 Settle errors
-	ErrVerificationFailed      = "invalid_exact_evm_verification_failed"
-	ErrFailedToParseSignature  = "invalid_exact_evm_failed_to_parse_signature"
+	ErrVerificationFailed     = "invalid_exact_evm_verification_failed"
+	ErrFailedToParseSignature = "invalid_exact_evm_failed_to_parse_signature"
+	// Reserved wire value: settle now reads deployment from the verify it already awaited, so
+	// it no longer performs the eth_getCode this reported on. Do not reassign.
 	ErrFailedToCheckDeployment = "invalid_exact_evm_failed_to_check_deployment"
 	ErrFailedToExecuteTransfer = "invalid_exact_evm_failed_to_execute_transfer"
 	// Reserved wire value (exact/v1); do not reassign.

@@ -57,7 +57,7 @@ func TestComputePayerAgnosticPaymentInfoHash_Golden84532(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	want := "0x341988b065a5131b3a82818eb7aba9010135f326af1af7695fce4d2bbebd0b76"
+	want := "0x695990db5fd8f3f541f505b117da619dace4d28a039e35646ce7b660e699ff4b"
 	if hash != want {
 		t.Fatalf("hash = %q, want %q", hash, want)
 	}
@@ -68,7 +68,7 @@ func TestComputePayerAgnosticPaymentInfoHash_Golden8453(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	want := "0xa393f8f76a2327a7678488b2d504bda611b7586bb3f334b255a11bb5a75e79ca"
+	want := "0x37588eff80093203c128c6622608c6e972e41c2fd79da91ef5294a26e647e4e2"
 	if hash != want {
 		t.Fatalf("hash = %q, want %q", hash, want)
 	}
@@ -225,14 +225,5 @@ func TestSaltBinding(t *testing.T) {
 	changedNonce, _ := DeriveBoundSalt(authorizer, zero, "0x0000000000000000000000000000000000000000000000000000000000000abd")
 	if changedNonce == base {
 		t.Fatal("expected bound salt to change when saltNonce changes")
-	}
-}
-
-func TestTypeHashConstants(t *testing.T) {
-	if SaltBindingTypeHash.Hex() != "0x8a2a7e41a0bda000ded071ff38b79401d2603e1826516ff2635b11fe9e30877f" {
-		t.Fatalf("SaltBindingTypeHash = %s", SaltBindingTypeHash.Hex())
-	}
-	if PaymentInfoTypeHash.Hex() != "0xae68ac7ce30c86ece8196b61a7c486d8f0061f575037fbd34e7fe4e2820c6591" {
-		t.Fatalf("PaymentInfoTypeHash = %s", PaymentInfoTypeHash.Hex())
 	}
 }

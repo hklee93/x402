@@ -20,6 +20,12 @@ type ExactEvmSchemeConfig struct {
 	EIP6492AllowedFactories []string
 	// SimulateInSettle reruns transfer simulation during settle. Verify always simulates.
 	SimulateInSettle bool
+	// EnableParallelVerifySimulation makes verify start the onchain transfer simulation
+	// concurrently with signature classification instead of after it, removing one RPC round
+	// trip. The cost is one wasted eth_call per payment rejected on signature grounds, so it is
+	// opt-in: leave it unset on a metered RPC provider, or where invalid payments are common
+	// enough that the wasted calls outweigh the latency win.
+	EnableParallelVerifySimulation bool
 }
 
 // ExactEvmScheme implements the SchemeNetworkFacilitator interface for EVM exact payments (V2)
@@ -50,12 +56,10 @@ func NewExactEvmScheme(signer evm.FacilitatorEvmSigner, config *ExactEvmSchemeCo
 	}
 }
 
-// SetPendingSettlementStore overrides the default in-memory
-// PendingSettlementStore. Used by multi-instance facilitators (e.g.
-// cdp-facilitator) to inject a shared, network-backed implementation (e.g.
-// Redis) so a settle retry landing on a different replica still reconciles
-// against the transaction the first replica broadcast. A nil store is a
-// no-op.
+// SetPendingSettlementStore overrides the default in-memory store.
+// A multi-instance facilitator injects a shared store so a settle retry on
+// another replica still sees the transaction the first replica broadcast.
+// A nil store is a no-op.
 func (f *ExactEvmScheme) SetPendingSettlementStore(store x402.PendingSettlementStore) {
 	if store != nil {
 		f.pendingStore = store
@@ -99,10 +103,13 @@ func (f *ExactEvmScheme) Verify(
 		if err != nil {
 			return nil, x402.NewVerifyError(ErrInvalidPayload, "", fmt.Sprintf("failed to parse Permit2 payload: %s", err.Error()))
 		}
-		return VerifyPermit2(ctx, f.signer, payload, requirements, permit2Payload, fctx, nil)
+		return VerifyPermit2(ctx, f.signer, payload, requirements, permit2Payload, fctx, &VerifyPermit2Options{
+			EnableParallelSimulation: f.config.EnableParallelVerifySimulation,
+		})
 	}
 
-	return f.verifyEIP3009(ctx, payload, requirements, true)
+	verifyResp, _, err := f.verifyEIP3009(ctx, payload, requirements, true)
+	return verifyResp, err
 }
 
 // Settle settles a V2 payment on-chain.
@@ -122,8 +129,9 @@ func (f *ExactEvmScheme) Settle(
 			return nil, x402.NewSettleError(ErrInvalidPayload, "", network, "", fmt.Sprintf("failed to parse Permit2 payload: %s", err.Error()))
 		}
 		return SettlePermit2(ctx, f.signer, payload, requirements, permit2Payload, fctx, &Permit2FacilitatorConfig{
-			SimulateInSettle:       f.config.SimulateInSettle,
-			PendingSettlementStore: f.pendingStore,
+			SimulateInSettle:         f.config.SimulateInSettle,
+			PendingSettlementStore:   f.pendingStore,
+			EnableParallelSimulation: f.config.EnableParallelVerifySimulation,
 		})
 	}
 

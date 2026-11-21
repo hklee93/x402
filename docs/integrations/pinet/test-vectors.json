@@ -1,0 +1,350 @@
+{
+  "profile": "pinet-pirc-x402-conformance",
+  "profile_version": "0.2.0",
+  "protocol": {
+    "x402_version": 2,
+    "scheme": "exact",
+    "networks": [
+      "pinet:testnet",
+      "pinet:mainnet"
+    ]
+  },
+  "status": "scenario_catalogue_not_executed",
+  "vectors": [
+    {
+      "id": "AMT-001",
+      "category": "amount",
+      "input": {
+        "amount": "10000000"
+      },
+      "expected": "accept_if_within_verified_asset_range",
+      "reason": "Canonical positive base-10 integer atomic amount."
+    },
+    {
+      "id": "AMT-002",
+      "category": "amount",
+      "input": {
+        "amount": "0"
+      },
+      "expected": "reject",
+      "reason": "Payment amount must be positive."
+    },
+    {
+      "id": "AMT-003",
+      "category": "amount",
+      "input": {
+        "amount": "-1"
+      },
+      "expected": "reject",
+      "reason": "Signed amount syntax is not accepted."
+    },
+    {
+      "id": "AMT-004",
+      "category": "amount",
+      "input": {
+        "amount": "1.25"
+      },
+      "expected": "reject",
+      "reason": "Decimal notation is not an atomic-unit integer."
+    },
+    {
+      "id": "AMT-005",
+      "category": "amount",
+      "input": {
+        "amount": "1e6"
+      },
+      "expected": "reject",
+      "reason": "Exponent notation is not accepted."
+    },
+    {
+      "id": "AMT-006",
+      "category": "amount",
+      "input": {
+        "amount": " 100 "
+      },
+      "expected": "reject",
+      "reason": "Whitespace must not be silently normalized."
+    },
+    {
+      "id": "NET-001",
+      "category": "network",
+      "input": {
+        "network": "pinet:testnet",
+        "expected_passphrase": "Pi Testnet",
+        "observed_passphrase": "Pi Testnet"
+      },
+      "expected": "accept_network_identity",
+      "reason": "Network identifier and exact passphrase agree."
+    },
+    {
+      "id": "NET-002",
+      "category": "network",
+      "input": {
+        "network": "pinet:testnet",
+        "expected_passphrase": "Pi Testnet",
+        "observed_passphrase": "Pi Network"
+      },
+      "expected": "reject_fail_closed",
+      "reason": "Mainnet passphrase must not be accepted for Testnet."
+    },
+    {
+      "id": "NET-003",
+      "category": "network",
+      "input": {
+        "network": "pinet:unknown",
+        "expected_passphrase": null,
+        "observed_passphrase": null
+      },
+      "expected": "reject",
+      "reason": "Unknown network identifiers are not inferred."
+    },
+    {
+      "id": "XDR-001",
+      "category": "transaction_structure",
+      "input": {
+        "operation_count": 2,
+        "operation_types": [
+          "invokeHostFunction",
+          "payment"
+        ]
+      },
+      "expected": "reject",
+      "reason": "Unexpected additional operation."
+    },
+    {
+      "id": "XDR-002",
+      "category": "transaction_structure",
+      "input": {
+        "operation_count": 1,
+        "operation_types": [
+          "invokeHostFunction"
+        ],
+        "function_name": "transfer",
+        "argument_count": 4
+      },
+      "expected": "reject",
+      "reason": "Transfer invocation argument count does not match the scheme."
+    },
+    {
+      "id": "SET-001",
+      "category": "settlement",
+      "input": {
+        "idempotency_key": "intent-001",
+        "payload_digest": "synthetic-payload-A",
+        "prior_state": "settled"
+      },
+      "expected": "return_or_reconcile_existing_outcome",
+      "reason": "A repeated identical request must not cause a second transfer."
+    },
+    {
+      "id": "SET-002",
+      "category": "settlement",
+      "input": {
+        "idempotency_key": "intent-001",
+        "payload_digest": "synthetic-payload-B",
+        "prior_state": "settled"
+      },
+      "expected": "reject_conflicting_reuse",
+      "reason": "An idempotency identity cannot be rebound to a different payment payload."
+    },
+    {
+      "id": "SET-003",
+      "category": "settlement_recovery",
+      "input": {
+        "broadcast_result": "accepted",
+        "confirmation_result": "timeout",
+        "persisted_transaction_identity": true
+      },
+      "expected": "pending_reconcile_before_retry",
+      "reason": "An uncertain broadcast outcome must be reconciled before any retry."
+    },
+    {
+      "id": "PIRC-001",
+      "category": "provenance",
+      "input": {
+        "asset_verification_state": "disputed",
+        "allowlisted_contract": false
+      },
+      "expected": "reject_asset",
+      "reason": "Unverified provenance does not authorize an asset for payment."
+    },
+    {
+      "id": "PIRC-002",
+      "category": "oracle",
+      "input": {
+        "source_count": 2,
+        "minimum_sources": 3,
+        "fresh": true
+      },
+      "expected": "quarantine_or_reject_quote",
+      "reason": "Below-quorum oracle data cannot be promoted to a trusted price input."
+    },
+    {
+      "id": "PIRC-003",
+      "category": "commerce",
+      "input": {
+        "payment_state": "verified",
+        "settlement_state": "pending",
+        "fulfillment_requested": true
+      },
+      "expected": "block_fulfillment",
+      "reason": "Verification alone is not settlement finality."
+    },
+    {
+      "id": "PIRC-004",
+      "category": "accounting",
+      "input": {
+        "collected_atomic": "1000",
+        "deductions_atomic": "250",
+        "allocations_atomic": "800"
+      },
+      "expected": "reject_non_conserving_allocation",
+      "reason": "Allocations exceed the distributable amount."
+    },
+    {
+      "id": "COM-001",
+      "category": "merchant_quote",
+      "input": {
+        "quote_expired": true,
+        "buyer_approved": true
+      },
+      "expected": "reject_require_new_quote",
+      "reason": "An expired quote cannot be used to create a new payment requirement."
+    },
+    {
+      "id": "COM-002",
+      "category": "merchant_quote",
+      "input": {
+        "approved_amount_atomic": "500",
+        "current_quote_amount_atomic": "550"
+      },
+      "expected": "reject_amount_mutation",
+      "reason": "A changed quote requires explicit buyer approval of a new payment amount."
+    },
+    {
+      "id": "EVT-001",
+      "category": "commerce_event",
+      "input": {
+        "event_id": "event-001",
+        "already_consumed": true
+      },
+      "expected": "idempotent_noop",
+      "reason": "Duplicate event delivery must not duplicate state transitions or fulfilment."
+    },
+    {
+      "id": "EVT-002",
+      "category": "commerce_event",
+      "input": {
+        "event_type": "PAYMENT_CONFIRMED",
+        "settlement_readback_present": false
+      },
+      "expected": "reject_or_quarantine",
+      "reason": "A commerce event cannot establish payment finality without independent settlement evidence."
+    },
+    {
+      "id": "QRN-001",
+      "category": "qr_nfc",
+      "input": {
+        "request_expired": true,
+        "nonce_reused": false
+      },
+      "expected": "reject",
+      "reason": "Expired payment handoff requests are not valid authorization requests."
+    },
+    {
+      "id": "QRN-002",
+      "category": "qr_nfc",
+      "input": {
+        "contains_private_key_material": true
+      },
+      "expected": "reject_and_raise_security_signal",
+      "reason": "QR/NFC transport must never carry wallet secrets."
+    },
+    {
+      "id": "SUB-001",
+      "category": "subscription",
+      "input": {
+        "billing_period": "2026-11",
+        "fresh_user_authorization": false
+      },
+      "expected": "do_not_submit_payment",
+      "reason": "A recurring billing agreement does not imply indefinite wallet authorization."
+    },
+    {
+      "id": "SUB-002",
+      "category": "subscription_recovery",
+      "input": {
+        "period_id": "period-001",
+        "broadcast_outcome": "unknown"
+      },
+      "expected": "reconcile_before_retry",
+      "reason": "An uncertain billing attempt must be reconciled before another attempt for the same period."
+    },
+    {
+      "id": "MET-001",
+      "category": "metrics",
+      "input": {
+        "included_event_classes": [
+          "settled",
+          "pending",
+          "self_transfer",
+          "duplicate"
+        ]
+      },
+      "expected": "exclude_ineligible_events_and_disclose",
+      "reason": "Economic metrics must exclude pending, duplicate and circular/self-transfer activity."
+    },
+    {
+      "id": "MET-002",
+      "category": "accounting",
+      "input": {
+        "source_amount_atomic": "1000",
+        "allocations_atomic": [
+          "600",
+          "500"
+        ]
+      },
+      "expected": "reject_non_conserving_allocation",
+      "reason": "Allocation totals must conserve the source amount using checked integer arithmetic."
+    },
+    {
+      "id": "GATE-001",
+      "category": "economic_gate",
+      "input": {
+        "required_gateway_statuses": [
+          "PASS",
+          "STALE",
+          "PASS",
+          "PASS"
+        ]
+      },
+      "expected": "aggregate_not_pass",
+      "reason": "A stale required gateway must prevent an aggregate PASS."
+    },
+    {
+      "id": "GATE-002",
+      "category": "economic_gate",
+      "input": {
+        "http_status": 200,
+        "body_status": "REVIEW_REQUIRED"
+      },
+      "expected": "preserve_review_required",
+      "reason": "HTTP success does not override the semantic status returned by an economic gateway."
+    },
+    {
+      "id": "REL-001",
+      "category": "release_policy",
+      "input": {
+        "testnet_checks_pass": true,
+        "mainnet_approval": false
+      },
+      "expected": "block_mainnet_release",
+      "reason": "Testnet success is not authorization to deploy or write to Mainnet."
+    }
+  ],
+  "limitations": [
+    "These are declarative scenarios, not signed XDR transaction fixtures.",
+    "No network request, signature verification, contract read-back, or payment was performed by publishing this file.",
+    "Implementations must derive asset decimals, contract allowlists, protocol rules, and finality behavior from verified network-specific sources."
+  ]
+}

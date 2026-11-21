@@ -23,13 +23,14 @@ from ....schemas import (  # noqa: E402
     SettleResponse,
     VerifyResponse,
 )
+from ..asset_cache import start_asset_contract_check  # noqa: E402
 from ..constants import (  # noqa: E402
     BALANCE_OF_ABI,
     ERC20_ALLOWANCE_ABI,
-    ERR_ASSET_NOT_DEPLOYED_CONTRACT,
     ERR_ERC20_APPROVAL_BROADCAST_FAILED,
     ERR_ERC20_APPROVAL_TX_FAILED,
     ERR_INSUFFICIENT_BALANCE,
+    ERR_INVALID_REQUIRED_AMOUNT,
     ERR_NETWORK_MISMATCH,
     ERR_PERMIT2_ALLOWANCE_REQUIRED,
     ERR_PERMIT2_AMOUNT_MISMATCH,
@@ -58,6 +59,7 @@ from ..types import (  # noqa: E402
     ExactPermit2TokenPermissions,
     ExactPermit2Witness,
     TypedDataField,
+    _is_uint256_string,
 )
 from ..utils import (  # noqa: E402
     create_permit2_nonce,
@@ -196,11 +198,9 @@ def verify_permit2(
     chain_id = get_evm_chain_id(str(requirements.network))
     token_address = normalize_address(requirements.asset)
 
-    code = signer.get_code(token_address)
-    if len(code) == 0:
-        return VerifyResponse(
-            is_valid=False, invalid_reason=ERR_ASSET_NOT_DEPLOYED_CONTRACT, payer=payer
-        )
+    # Start after network/asset are known; await after signature work so a failed
+    # pre-check does not RPC or populate the positive cache.
+    asset_check = start_asset_contract_check(signer, str(requirements.network), requirements.asset)
 
     # 3. Spender check
     try:
@@ -253,6 +253,12 @@ def verify_permit2(
         return VerifyResponse(is_valid=False, invalid_reason=ERR_PERMIT2_NOT_YET_VALID, payer=payer)
 
     # 7. Amount check
+    if not _is_uint256_string(requirements.amount):
+        return VerifyResponse(
+            is_valid=False,
+            invalid_reason=ERR_INVALID_REQUIRED_AMOUNT,
+            payer=payer,
+        )
     if amount_val != int(requirements.amount):
         return VerifyResponse(
             is_valid=False, invalid_reason=ERR_PERMIT2_AMOUNT_MISMATCH, payer=payer
@@ -304,6 +310,10 @@ def verify_permit2(
         return VerifyResponse(
             is_valid=False, invalid_reason=ERR_PERMIT2_INVALID_SIGNATURE, payer=payer
         )
+
+    asset_reason = asset_check.await_result()
+    if asset_reason:
+        return VerifyResponse(is_valid=False, invalid_reason=asset_reason, payer=payer)
 
     # 10. Allowance check — with extension fallbacks
     allowance_result = _verify_permit2_allowance(
@@ -645,6 +655,17 @@ def _settle_permit2_direct(
         return _map_settle_error(e, network, payer)
 
 
+def _split_eip2612_signature(signature: str) -> tuple[int, bytes, bytes]:
+    """permit() accepts v of 27 or 28."""
+    sig_raw = hex_to_bytes(signature)
+    if len(sig_raw) != 65:
+        raise ValueError("EIP-2612 signature must be 65 bytes")
+    v = sig_raw[64]
+    if v < 27:
+        v += 27
+    return v, sig_raw[:32], sig_raw[32:64]
+
+
 def _settle_permit2_with_eip2612(
     signer: FacilitatorEvmSigner,
     payload: PaymentPayload,
@@ -662,15 +683,7 @@ def _settle_permit2_with_eip2612(
             permit2_payload
         )
 
-        sig_hex = eip2612_info.signature
-        sig_raw = hex_to_bytes(sig_hex)
-        if len(sig_raw) != 65:
-            return _map_settle_error(
-                ValueError("EIP-2612 signature must be 65 bytes"), network, payer
-            )
-        r = sig_raw[:32]
-        s = sig_raw[32:64]
-        v = sig_raw[64]
+        v, r, s = _split_eip2612_signature(eip2612_info.signature)
 
         permit2612_tuple = (
             int(eip2612_info.amount),
