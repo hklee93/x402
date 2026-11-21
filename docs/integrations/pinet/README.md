@@ -17,6 +17,7 @@ This directory documents an optional mapping between the Pi Network `pinet` exac
 
 - [PiRC interoperability profile](./pirc-interoperability-profile.md) — bounded crosswalk and security invariants.
 - [Extended capability map](./extended-capability-map.md) — product valuation, commerce events, QR/NFC, subscriptions, four economic gateways, metrics and release evidence.
+- [Economic gateway API proposal](./economic-gateway-api.md) — versioned request/response envelope, gateway endpoints, aggregation policy, errors and security controls. Proposed only; not a deployed API.
 - [Conformance matrix](./conformance-matrix.md) — test cases, layers, and evidence required for each claim.
 - [Test vectors](./test-vectors.json) — machine-readable scenario catalogue. These are scenario definitions, not executed test results or signed XDR fixtures.
 
